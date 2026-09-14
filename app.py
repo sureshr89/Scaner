@@ -13,6 +13,7 @@ REFRESH_SECONDS = 15
 QUOTE_URL = "https://api.dhan.co/v2/marketfeed/ohlc"
 HISTORY_URL = "https://api.dhan.co/v2/charts/historical"
 NSE_URL = "https://www.nseindia.com/api/equity-stockIndices?index=NIFTY%20500"
+NIFTY_CSV_URL = "https://www.niftyindices.com/IndexConstituent/ind_nifty500list.csv"
 DHAN_MASTER_URL = "https://images.dhan.co/api-data/api-scrip-master.csv"
 IST = ZoneInfo("Asia/Kolkata")
 
@@ -34,23 +35,42 @@ def norm(value):
 def first_column(frame, names):
     lookup = {str(c).lower().replace(" ", "_"): c for c in frame.columns}
     for name in names:
-        if name in lookup:
-            return lookup[name]
+        if name.lower() in lookup:
+            return lookup[name.lower()]
     return None
+
+
+def universe_session():
+    session = requests.Session()
+    session.headers.update({"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/125 Safari/537.36", "Accept": "application/json,text/csv,*/*", "Referer": "https://www.nseindia.com/"})
+    return session
 
 
 @st.cache_data(ttl=86400, show_spinner=False)
 def download_nifty500():
-    session = requests.Session()
-    session.headers.update({"User-Agent": "Mozilla/5.0", "Accept": "application/json,text/csv,*/*", "Referer": "https://www.nseindia.com/"})
-    session.get("https://www.nseindia.com/", timeout=30)
-    nse_response = session.get(NSE_URL, timeout=30)
-    nse_response.raise_for_status()
-    records = nse_response.json().get("data", [])
-    nse = pd.DataFrame(records)
-    symbol_col = first_column(nse, ["symbol"])
+    session = universe_session()
+    nse = None
+    errors = []
+    try:
+        session.get("https://www.nseindia.com/", timeout=20)
+        response = session.get(NSE_URL, timeout=30)
+        response.raise_for_status()
+        nse = pd.DataFrame(response.json().get("data", []))
+    except Exception as exc:
+        errors.append(f"NSE API: {exc}")
+    if nse is None or nse.empty:
+        try:
+            response = session.get(NIFTY_CSV_URL, timeout=30)
+            response.raise_for_status()
+            nse = pd.read_csv(StringIO(response.text))
+        except Exception as exc:
+            errors.append(f"Nifty CSV: {exc}")
+    if nse is None or nse.empty:
+        raise RuntimeError("; ".join(errors))
+
+    symbol_col = first_column(nse, ["symbol", "company_symbol"])
     if not symbol_col:
-        raise RuntimeError("NSE did not return Nifty 500 symbols")
+        raise RuntimeError(f"No symbol column in Nifty data: {list(nse.columns)}")
     nse["stock"] = nse[symbol_col].astype(str).str.strip().str.upper()
     nse = nse[~nse["stock"].str.contains("NIFTY", na=False)].copy()
     sector_col = first_column(nse, ["industry", "sector", "industry_info"])
@@ -58,39 +78,43 @@ def download_nifty500():
     nse["join_key"] = nse["stock"].map(norm)
     nse = nse.drop_duplicates("join_key")
 
-    master_response = session.get(DHAN_MASTER_URL, timeout=60)
+    master_response = session.get(DHAN_MASTER_URL, timeout=90)
     master_response.raise_for_status()
     master = pd.read_csv(StringIO(master_response.text), low_memory=False)
-    segment_col = first_column(master, ["exchange_segment", "exchange_segment_name", "exchange_segment_code"])
+    segment_col = first_column(master, ["exchange_segment", "exchange_segment_name", "exchange_segment_code", "sem_exm_exch_id"])
+    market_segment_col = first_column(master, ["sem_segment", "segment"])
     symbol_master_col = first_column(master, ["symbol", "trading_symbol", "sem_trading_symbol"])
-    id_col = first_column(master, ["security_id", "sem_security_id"])
+    id_col = first_column(master, ["security_id", "sem_security_id", "sem_smst_security_id"])
     if not (segment_col and symbol_master_col and id_col):
-        raise RuntimeError("Dhan instrument master format was not recognised")
-    dm = master[master[segment_col].astype(str).str.upper().eq("NSE_EQ")].copy()
+        raise RuntimeError(f"Dhan master columns not recognised: {list(master.columns)[:25]}")
+
+    dm = master.copy()
+    exchange_values = dm[segment_col].astype(str).str.upper()
+    if segment_col.lower() == "sem_exm_exch_id":
+        dm = dm[exchange_values.eq("NSE")]
+        if market_segment_col:
+            dm = dm[dm[market_segment_col].astype(str).str.upper().isin(["E", "EQUITY", "NSE_EQ"])]
+    else:
+        dm = dm[exchange_values.eq("NSE_EQ")]
     dm["join_key"] = dm[symbol_master_col].map(norm)
     dm["security_id"] = pd.to_numeric(dm[id_col], errors="coerce")
-    dm = dm.drop_duplicates("join_key")[["join_key", "security_id"]]
-    result = nse[["stock", "sector", "join_key"]].merge(dm, on="join_key", how="left")
-    result = result.dropna(subset=["security_id"])
+    dm = dm.dropna(subset=["security_id"]).drop_duplicates("join_key")[["join_key", "security_id"]]
+    result = nse[["stock", "sector", "join_key"]].merge(dm, on="join_key", how="inner")
     result["security_id"] = result["security_id"].astype(int)
     result = result[["stock", "sector", "security_id"]].drop_duplicates("stock").sort_values("stock")
     if len(result) < 400:
-        raise RuntimeError(f"Only {len(result)} Nifty constituents could be mapped to Dhan")
+        raise RuntimeError(f"Only {len(result)} stocks mapped from Nifty 500 to Dhan")
     return result
 
 
 def load_stocks():
     try:
-        stocks = download_nifty500()
-        return stocks
+        return download_nifty500()
     except Exception as exc:
         fallback = pd.read_csv("stocks.csv")
-        required = {"stock", "sector", "security_id"}
-        if not required.issubset(fallback.columns):
-            raise ValueError("stocks.csv must contain stock, sector and security_id")
         fallback["security_id"] = pd.to_numeric(fallback["security_id"], errors="coerce")
         fallback = fallback.dropna(subset=["stock", "sector", "security_id"]).copy()
-        st.warning(f"Nifty 500 download failed, using local file with {len(fallback)} stocks: {exc}")
+        st.error(f"Nifty 500 loading failed; using only {len(fallback)} local stocks. Details: {exc}")
         return fallback
 
 
@@ -99,7 +123,7 @@ def market_open(now):
 
 
 def dhan_snapshot(stocks):
-    response = requests.post(QUOTE_URL, headers=headers(), json={"NSE_EQ": sorted({int(x) for x in stocks.security_id})}, timeout=30)
+    response = requests.post(QUOTE_URL, headers=headers(), json={"NSE_EQ": sorted({int(x) for x in stocks.security_id})}, timeout=60)
     response.raise_for_status()
     return response.json()
 
@@ -117,7 +141,7 @@ def flatten(snapshot):
 def historical_one(security_id, start, end):
     payload = {"securityId": str(int(security_id)), "exchangeSegment": "NSE_EQ", "instrument": "EQUITY", "expiryCode": 0, "oi": False, "fromDate": start, "toDate": end}
     try:
-        response = requests.post(HISTORY_URL, headers=headers(), json=payload, timeout=20)
+        response = requests.post(HISTORY_URL, headers=headers(), json=payload, timeout=30)
         if not response.ok:
             return {"pdc": None, "pdh": None, "pdl": None, "error": f"HTTP {response.status_code}: {response.text[:250]}"}
         body = response.json()
