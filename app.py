@@ -19,7 +19,8 @@ def secret(name):
 
 
 def headers():
-    token, client = secret("DHAN_ACCESS_TOKEN"), secret("DHAN_CLIENT_ID")
+    token = secret("DHAN_ACCESS_TOKEN")
+    client = secret("DHAN_CLIENT_ID")
     if not token or not client:
         raise RuntimeError("Add DHAN_CLIENT_ID and DHAN_ACCESS_TOKEN in Streamlit Secrets.")
     return {"Accept": "application/json", "Content-Type": "application/json", "access-token": token, "client-id": client}
@@ -55,6 +56,8 @@ def flatten(snapshot):
         if not isinstance(instruments, dict):
             continue
         for sid, packet in instruments.items():
+            if not isinstance(packet, dict):
+                continue
             o = packet.get("ohlc") or {}
             out[(segment, str(sid))] = {"ltp": packet.get("last_price"), "open": o.get("open"), "high": o.get("high"), "low": o.get("low")}
     return out
@@ -62,29 +65,45 @@ def flatten(snapshot):
 
 @st.cache_data(ttl=86400, show_spinner=False)
 def historical_one(security_id, from_date, to_date):
-    payload = {"securityId": str(int(security_id)), "exchangeSegment": "NSE_EQ", "instrument": "EQUITY", "expiryCode": 0, "oi": False, "fromDate": from_date, "toDate": to_date}
+    payload = {
+        "securityId": str(int(security_id)),
+        "exchangeSegment": "NSE_EQ",
+        "instrument": "EQUITY",
+        "expiryCode": 0,
+        "oi": False,
+        "fromDate": from_date,
+        "toDate": to_date,
+    }
     r = requests.post(HISTORY_URL, headers=headers(), json=payload, timeout=20)
-    r.raise_for_status()
+    if not r.ok:
+        detail = r.text[:300].replace("\n", " ")
+        raise RuntimeError(f"security {security_id}: Dhan historical API {r.status_code}: {detail}")
     body = r.json()
     data = body.get("data", body)
     if not isinstance(data, dict) or not data.get("timestamp"):
         return {"pdc": None, "pdh": None, "pdl": None}
     rows = pd.DataFrame(data)
     rows["date"] = pd.to_datetime(rows["timestamp"], unit="s", utc=True).dt.tz_convert(IST).dt.date
-    rows = rows.sort_values("date")
-    if len(rows) < 2:
+    rows = rows.sort_values("date").drop_duplicates("date")
+    if rows.empty:
         return {"pdc": None, "pdh": None, "pdl": None}
-    prev = rows.iloc[-2]
+    # toDate is non-inclusive, so the final returned candle is the latest completed trading day.
+    prev = rows.iloc[-1]
     return {"pdc": float(prev["close"]), "pdh": float(prev["high"]), "pdl": float(prev["low"])}
 
 
 def historical(stocks, now):
-    start = (now.date() - timedelta(days=14)).isoformat()
-    end = (now.date() + timedelta(days=1)).isoformat()
-    result = {}
+    # Do not send a future date to Dhan. Its toDate is non-inclusive.
+    start = (now.date() - timedelta(days=30)).isoformat()
+    end = now.date().isoformat()
+    result, errors = {}, []
     for sid in stocks.security_id:
-        result[int(sid)] = historical_one(sid, start, end)
-    return result
+        try:
+            result[int(sid)] = historical_one(sid, start, end)
+        except Exception as exc:
+            result[int(sid)] = {"pdc": None, "pdh": None, "pdl": None}
+            errors.append(str(exc))
+    return result, errors
 
 
 def build_frame(stocks, live, hist):
@@ -106,27 +125,29 @@ def calculate(df):
     down = df["LTP"].lt(df["PDC"]).groupby(df["Sector"]).transform("sum")
     df["Sector AD"] = up / down.replace(0, float("nan"))
     df["Sector % from PDC"] = (df["Sector LTP"] - df["Sector PDC"]) / df["Sector PDC"] * 100
-    buy = df["PDC"].notna() & df["PDH"].notna() & df["LTP"].notna() & df["Sector LTP"].notna() & df["PDC"].gt(0)
+    buy = df["PDC"].notna() & df["PDH"].notna() & df["LTP"].notna() & df["Sector LTP"].notna()
     buy &= ((df["PDH"] - df["PDC"]) / df["PDC"] * 100 <= 1)
     buy &= df["LTP"].gt(df["PDH"]) & df["Sector LTP"].gt(df["Sector PDC"])
     buy &= df["Today's Low"].lt(df["PDH"]) & df["Today's High"].gt(df["PDH"]) & df["Sector AD"].gt(1)
-    sell = df["PDC"].notna() & df["PDL"].notna() & df["LTP"].notna() & df["PDC"].gt(0)
+    sell = df["PDC"].notna() & df["PDL"].notna() & df["LTP"].notna() & df["Sector LTP"].notna()
     sell &= ((df["PDC"] - df["PDL"]) / df["PDC"] * 100 <= 1)
     sell &= df["LTP"].lt(df["PDL"]) & df["Sector LTP"].lt(df["Sector PDC"])
     sell &= df["Today's High"].gt(df["PDL"]) & df["Today's Low"].lt(df["PDL"]) & df["Sector AD"].lt(1)
-    df["Buy Alignment 🟢"] = buy
-    df["Sell Alignment 🔴"] = sell
+    df["Buy Alignment 🟢"] = buy.fillna(False)
+    df["Sell Alignment 🔴"] = sell.fillna(False)
     return df
 
 
 def table(df, kind):
-    if df.empty:
-        return pd.DataFrame(columns=["Rank", "Stock", "Sector", "LTP", "PDC", "PDH" if kind == "buy" else "PDL", "Today's Open", "Today's Low", "Today's High", "Sector LTP", "Sector PDC", "Sector % from PDC", "Sector AD", "Buy Alignment 🟢" if kind == "buy" else "Sell Alignment 🔴"])
     level = "PDH" if kind == "buy" else "PDL"
     align = "Buy Alignment 🟢" if kind == "buy" else "Sell Alignment 🔴"
-    x = df[df[align]].copy()
-    x["Rank"] = range(1, len(x) + 1)
     cols = ["Rank", "Stock", "Sector", "LTP", "PDC", level, "Today's Open", "Today's Low", "Today's High", "Sector LTP", "Sector PDC", "Sector % from PDC", "Sector AD", align]
+    if df.empty:
+        return pd.DataFrame(columns=cols)
+    x = df[df[align]].copy()
+    if x.empty:
+        return pd.DataFrame(columns=cols)
+    x["Rank"] = range(1, len(x) + 1)
     return x[cols]
 
 
@@ -138,13 +159,17 @@ st.info(f"India time: {now:%Y-%m-%d %H:%M:%S IST} | {'Market open' if open_now e
 
 try:
     stocks = load_stocks()
-    hist = historical(stocks, now)
+    hist, history_errors = historical(stocks, now)
     live = flatten(dhan_snapshot(stocks)) if open_now else {}
     data = calculate(build_frame(stocks, live, hist))
     buys = table(data, "buy")
     sells = table(data, "sell")
     a, b, c = st.columns(3)
     a.metric("Stocks", len(data)); b.metric("🟢 Buy", len(buys)); c.metric("🔴 Sell", len(sells))
+    if history_errors:
+        st.warning(f"Historical data unavailable for {len(history_errors)} stock request(s). Check Dhan Data API access and security IDs.")
+        with st.expander("Historical API details"):
+            st.write("\n".join(history_errors))
     if not open_now:
         st.warning("Live LTP/today OHLC are blank while NSE is closed. PDC/PDH/PDL are historical Dhan values.")
     st.subheader("🟢 BUY WATCHLIST"); st.dataframe(buys, use_container_width=True)
