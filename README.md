@@ -1,28 +1,49 @@
-# Scaner
+# Scaner — Nifty Midcap 150
 
-## Build the Nifty 500 universe
+Streamlit scanner for the **Nifty Midcap 150** universe using Dhan market data.
 
-You do **not** need to prepare a CSV manually. Run:
+## Run locally
 
 ```bash
-pip install pandas requests
-python build_nifty500.py
+pip install -r requirements.txt
+streamlit run app.py
 ```
 
-The script reads the current Nifty 500 constituent records from NSE and maps them to the Dhan instrument master. It writes `stocks.csv` with:
+## Streamlit Cloud
 
-- `stock`
-- `company_name`
-- `sector`
-- `exchange_segment`
-- `security_id`
-- `mapping_status`
-- `isin` when available
+1. Open Streamlit Community Cloud.
+2. Create a new app from this repository.
+3. Select branch `main` and file `app.py`.
+4. In **Settings → Secrets**, add:
 
-Rows with missing Dhan IDs are retained as `MISSING_DHAN_ID` so they can be reviewed rather than silently discarded.
+```toml
+DHAN_CLIENT_ID = "your_dhan_client_id"
+DHAN_ACCESS_TOKEN = "your_dhan_access_token"
+```
 
-NSE publishes the Nifty 500 constituent list through its official Nifty 500 page: https://www.nseindia.com/static/products-services/indices-nifty500-index
+5. Deploy or reboot the app.
 
-## Dhan credentials
+Never commit Dhan credentials to GitHub.
 
-Live LTP data must be fetched using your own Dhan account credentials. Keep them local, for example in Streamlit secrets or environment variables; do not commit them to GitHub.
+## Output
+
+The app displays one table containing:
+
+- Stock
+- Sector
+- Sector A/D Ratio — stocks above PDC divided by stocks below PDC
+- LTP
+- PDC — previous completed daily close
+- PDH — previous completed daily high
+- PDL — previous completed daily low
+- PDC to PDH %
+- PDC to PDL %
+
+The app refreshes live quotes every 15 seconds and caches historical data for 24 hours. When the market is closed, LTP can be blank while PDC/PDH/PDL remain available.
+
+## Audit notes
+
+- Universe is explicitly validated to map exactly 150 constituents to Dhan.
+- Historical requests are sequential and rate-limit aware.
+- Historical API errors are exposed in the UI.
+- The scanner does not place trades; it is informational only.
