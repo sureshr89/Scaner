@@ -124,15 +124,20 @@ def previous_ohlc(security_id, start, end):
     payload = {"securityId": str(int(security_id)), "exchangeSegment": "NSE_EQ", "instrument": "EQUITY", "expiryCode": 0, "oi": False, "fromDate": start, "toDate": end}
     response = requests.post(HISTORY_URL, headers=headers(), json=payload, timeout=30)
     response.raise_for_status()
-    data = response.json().get("data", {})
+    data = response.json().get("data") or {}
+    if not isinstance(data, dict):
+        return {"PDC": None, "PDH": None, "PDL": None, "History Error": "Unexpected historical response"}
     fields = ["timestamp", "close", "high", "low"]
     if not all(field in data for field in fields):
-        return {"PDC": None, "PDH": None, "PDL": None, "History Error": "Incomplete historical response"}
-    candles = pd.DataFrame(data)[fields].apply(pd.to_numeric, errors="coerce").dropna().sort_values("timestamp")
+        return {"PDC": None, "PDH": None, "PDL": None, "History Error": f"Missing fields: {', '.join(set(fields) - set(data))}"}
+    candles = pd.DataFrame({field: data[field] for field in fields})
+    for field in fields:
+        candles[field] = pd.to_numeric(candles[field], errors="coerce")
+    candles = candles.dropna(subset=fields).sort_values("timestamp")
     if candles.empty:
         return {"PDC": None, "PDH": None, "PDL": None, "History Error": "No historical candle"}
     candle = candles.iloc[-1]
-    return {"PDC": float(candle.close), "PDH": float(candle.high), "PDL": float(candle.low), "History Error": None}
+    return {"PDC": float(candle["close"]), "PDH": float(candle["high"]), "PDL": float(candle["low"]), "History Error": None}
 
 
 def bias(value):
@@ -143,14 +148,10 @@ def bias(value):
 
 
 def calculate(df):
-    required = ["LTP", "PDC", "PDH", "PDL"]
-    for field in required:
-        if field not in df.columns:
-            df[field] = pd.NA
+    for field in ["LTP", "PDC", "PDH", "PDL"]:
+        if field not in df.columns: df[field] = pd.NA
         df[field] = pd.to_numeric(df[field], errors="coerce")
-
-    if "Sector" not in df.columns:
-        df["Sector"] = "UNKNOWN"
+    if "Sector" not in df.columns: df["Sector"] = "UNKNOWN"
     up = df["LTP"].gt(df["PDC"]).groupby(df["Sector"]).transform("sum")
     down = df["LTP"].lt(df["PDC"]).groupby(df["Sector"]).transform("sum")
     ratio = up / down.replace(0, float("nan"))
@@ -168,9 +169,8 @@ st.caption("Current Nifty Midcap 150 universe | Dhan live LTP | Previous complet
 now = datetime.now(IST)
 try:
     stocks = load_universe()
-    end = now.date() - timedelta(days=1)
-    while end.weekday() >= 5: end -= timedelta(days=1)
-    start = end - timedelta(days=10)
+    end = now.date()
+    start = end - timedelta(days=30)
     history = {}
     progress = st.progress(0, text="Loading previous-day OHLC...")
     for index, security_id in enumerate(stocks["security_id"], 1):
@@ -178,8 +178,7 @@ try:
         except Exception as error: history[int(security_id)] = {"PDC": None, "PDH": None, "PDL": None, "History Error": str(error)}
         progress.progress(index / 150, text=f"Historical data: {index}/150")
     progress.empty()
-    market_open = now.weekday() < 5 and dt_time(9, 15) <= now.time() <= dt_time(15, 30)
-    live = live_quotes(stocks) if market_open else {}
+    live = live_quotes(stocks)
     rows = []
     for record in stocks.to_dict("records"):
         security_id = int(record["security_id"])
