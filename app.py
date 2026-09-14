@@ -101,8 +101,7 @@ def load_universe():
 
     dm = master.copy()
     ex = dm[segment].astype(str).str.upper().str.strip()
-    allowed_exchange = {"NSE", "NSE_EQ", "NSE EQUITY"}
-    dm = dm[ex.isin(allowed_exchange)]
+    dm = dm[ex.isin({"NSE", "NSE_EQ", "NSE EQUITY"})]
     if market:
         market_values = dm[market].astype(str).str.upper().str.strip()
         dm = dm[market_values.isin({"E", "EQUITY", "NSE_EQ", "NSE EQUITY", "NA", "NAN"})]
@@ -112,11 +111,13 @@ def load_universe():
     frame["exact_key"] = frame.stock.astype(str).str.upper().str.strip()
     frame["key"] = frame.stock.map(clean_key)
     dm = dm.dropna(subset=["security_id"])
+
     exact = dm.drop_duplicates("exact_key")[["exact_key", "security_id"]]
     result = frame[["stock", "sector", "exact_key", "key"]].merge(exact, on="exact_key", how="left")
     missing = result["security_id"].isna()
-    fallback = dm.drop_duplicates("key")[["key", "security_id"]]
-    result.loc[missing, "security_id"] = result.loc[missing, ["key"]].merge(fallback, on="key", how="left")["security_id_y"].to_numpy()
+    fallback_map = dm.drop_duplicates("key").set_index("key")["security_id"]
+    result.loc[missing, "security_id"] = result.loc[missing, "key"].map(fallback_map)
+
     result = result.dropna(subset=["security_id"])
     result["security_id"] = result["security_id"].astype(int)
     result = result[["stock", "sector", "security_id"]].drop_duplicates("stock").sort_values("stock").reset_index(drop=True)
@@ -154,14 +155,12 @@ def previous_ohlc(sid, start, end):
         return {"PDC": None, "PDH": None, "PDL": None}
     unit = "ms" if candles["timestamp"].abs().max() > 10_000_000_000 else "s"
     candles["trade_date"] = pd.to_datetime(candles["timestamp"], unit=unit, utc=True, errors="coerce").dt.tz_convert(IST).dt.date
-    previous_day = datetime.now(IST).date() - timedelta(days=1)
-    completed = candles[candles["trade_date"] < datetime.now(IST).date()]
+    today = datetime.now(IST).date()
+    previous_day = today - timedelta(days=1)
+    completed = candles[candles["trade_date"] < today]
     if completed.empty:
         return {"PDC": None, "PDH": None, "PDL": None}
-    if previous_day in set(completed["trade_date"]):
-        candle = completed[completed["trade_date"] == previous_day].iloc[-1]
-    else:
-        candle = completed.iloc[-1]
+    candle = completed[completed["trade_date"] == previous_day].iloc[-1] if previous_day in set(completed["trade_date"]) else completed.iloc[-1]
     return {"PDC": float(candle["close"]), "PDH": float(candle["high"]), "PDL": float(candle["low"])}
 
 
@@ -181,15 +180,12 @@ def load_history(ids, start, end):
 
 
 def calculate(data, live_is_fresh=True):
-    numeric_fields = ["LTP", "PDC", "PDH", "PDL", "Today's Low", "Today's High"]
-    for field in numeric_fields:
+    for field in ["LTP", "PDC", "PDH", "PDL", "Today's Low", "Today's High"]:
         data[field] = pd.to_numeric(data.get(field, pd.Series(index=data.index, dtype=float)), errors="coerce")
     valid = data["LTP"].notna() & data["PDC"].notna() & data["PDH"].notna() & data["PDL"].notna()
     up = (valid & data["LTP"].gt(data["PDC"])).groupby(data["Sector"]).transform("sum")
     down = (valid & data["LTP"].lt(data["PDC"])).groupby(data["Sector"]).transform("sum")
-    ratio = up.div(down.replace(0, pd.NA))
-    ratio = ratio.mask((up > 0) & (down == 0), float("inf"))
-    ratio = ratio.mask((up == 0) & (down == 0), pd.NA)
+    ratio = up.div(down.replace(0, pd.NA)).mask((up > 0) & (down == 0), float("inf")).mask((up == 0) & (down == 0), pd.NA)
     data["Sector A/D Ratio"] = ratio
     data["Sector Bias"] = ratio.map(lambda x: "🟢 Bullish" if pd.notna(x) and x > 1 else "🔴 Bearish" if pd.notna(x) and x < 1 else "⚪ Neutral" if pd.notna(x) else "N/A")
     good = data["PDC"].gt(0)
@@ -221,8 +217,7 @@ def render():
     quote_error, live_is_fresh = None, False
     if market_open(now):
         try:
-            quotes = live_quotes(ids)
-            st.session_state.last_live_quotes = quotes
+            st.session_state.last_live_quotes = live_quotes(ids)
             st.session_state.quote_time = now
         except Exception as exc:
             quote_error = f"Live quote error: {exc}"
