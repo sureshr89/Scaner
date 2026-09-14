@@ -109,7 +109,8 @@ def load_universe():
 
 
 def live_quotes(stocks):
-    ids = sorted(stocks["security_id"].astype(int).unique())
+    # Convert NumPy/Pandas integer scalars to native Python ints before JSON encoding.
+    ids = sorted({int(value) for value in stocks["security_id"].dropna().tolist()})
     response = requests.post(QUOTE_URL, headers=headers(), json={"NSE_EQ": ids}, timeout=60)
     response.raise_for_status()
     out = {}
@@ -144,12 +145,13 @@ def previous_ohlc(security_id, start, end):
 def load_history(security_ids, start, end):
     history = {}
     progress = st.progress(0, text="Loading historical data once for today...")
+    total = len(security_ids)
     for index, security_id in enumerate(security_ids, 1):
         try:
             history[int(security_id)] = previous_ohlc(security_id, start, end)
         except Exception as error:
             history[int(security_id)] = {"PDC": None, "PDH": None, "PDL": None, "History Error": str(error)}
-        progress.progress(index / len(security_ids), text=f"Historical data: {index}/{len(security_ids)}")
+        progress.progress(index / total, text=f"Historical data: {index}/{total}")
     progress.empty()
     return history
 
@@ -183,7 +185,7 @@ def render_scanner():
     stocks = load_universe()
     end = now.date()
     start = end - timedelta(days=30)
-    history = load_history(tuple(stocks["security_id"].astype(int)), start.isoformat(), end.isoformat())
+    history = load_history(tuple(int(value) for value in stocks["security_id"].dropna().tolist()), start.isoformat(), end.isoformat())
     live = live_quotes(stocks)
     rows = []
     for record in stocks.to_dict("records"):
