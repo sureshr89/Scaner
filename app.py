@@ -180,7 +180,7 @@ def market_open(now):
 def render():
     now = datetime.now(IST)
     stocks = load_universe()
-    ids = tuple(stocks.security_id.astype(int))
+    ids = tuple(stocks["security_id"].astype(int))
     history, failures = load_history(ids, (now.date() - timedelta(days=30)).isoformat(), now.date().isoformat())
     if failures:
         with st.expander(f"Historical data warnings ({len(failures)})"):
@@ -203,9 +203,9 @@ def render():
         st.caption(f"Quote snapshot: {quote_time.strftime('%Y-%m-%d %H:%M:%S %Z')} ({int((now - quote_time).total_seconds() // 60)} min old)")
     rows = []
     for record in stocks.to_dict("records"):
-        sid = int(record.security_id)
+        sid = int(record["security_id"])
         quote, old = live.get(("NSE_EQ", str(sid)), {}), history.get(sid, {})
-        rows.append({"Stock": record.stock, "Sector": record.sector, **{k: quote.get(k) for k in ["LTP", "Today's Open", "Today's Low", "Today's High"]}, **{k: old.get(k) for k in ["PDC", "PDH", "PDL"]}})
+        rows.append({"Stock": record["stock"], "Sector": record["sector"], **{k: quote.get(k) for k in ["LTP", "Today's Open", "Today's Low", "Today's High"]}, **{k: old.get(k) for k in ["PDC", "PDH", "PDL"]}})
     data = calculate(pd.DataFrame(rows))
     columns = ["Stock", "Sector", "Sector A/D Ratio", "Sector Bias", "LTP", "Today's Open", "Today's Low", "Today's High", "PDC", "PDH", "PDL", "PDC to PDH %", "PDC to PDL %"]
     st.metric("Stocks scanned", len(data))
