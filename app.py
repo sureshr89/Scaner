@@ -37,7 +37,8 @@ def historical_one(sid,start,end):
     try:
         r=requests.post(HISTORY_URL,headers=headers(),json=payload,timeout=20)
         if not r.ok: return {"pdc":None,"pdh":None,"pdl":None,"error":f"security {sid}: HTTP {r.status_code} {r.text[:200]}"}
-        d=r.json().get("data",{})
+        body=r.json()
+        d=body.get("data",body) if isinstance(body,dict) else {}
         if not isinstance(d,dict): return {"pdc":None,"pdh":None,"pdl":None,"error":"Invalid response"}
         cols=["timestamp","close","high","low"]
         if any(c not in d for c in cols): return {"pdc":None,"pdh":None,"pdl":None,"error":"Missing candle fields"}
