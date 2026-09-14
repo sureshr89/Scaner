@@ -15,6 +15,7 @@ CSV_URL = "https://www.niftyindices.com/IndexConstituent/ind_niftymidcap150list.
 MASTER_URL = "https://images.dhan.co/api-data/api-scrip-master.csv"
 QUOTE_URL = "https://api.dhan.co/v2/marketfeed/ohlc"
 HISTORY_URL = "https://api.dhan.co/v2/charts/historical"
+MAX_QUOTE_AGE_MINUTES = 5
 
 
 def secret(name):
@@ -50,6 +51,10 @@ def retry_request(method, url, session=None, **kwargs):
 def pick(frame, names):
     lookup = {str(c).lower().replace(" ", "_"): c for c in frame.columns}
     return next((lookup[n.lower()] for n in names if n.lower() in lookup), None)
+
+
+def clean_key(value):
+    return "".join(ch for ch in str(value).upper().strip() if ch.isalnum())
 
 
 @st.cache_data(ttl=86400, show_spinner=False)
@@ -95,16 +100,25 @@ def load_universe():
         raise RuntimeError(f"Dhan master columns not recognised: {list(master.columns)[:30]}")
 
     dm = master.copy()
-    ex = dm[segment].astype(str).str.upper()
-    dm = dm[ex.eq("NSE") if segment.lower() == "sem_exm_exch_id" else ex.eq("NSE_EQ")]
-    if segment.lower() == "sem_exm_exch_id" and market:
-        dm = dm[dm[market].astype(str).str.upper().isin(["E", "EQUITY", "NSE_EQ"])]
-    dm["key"] = dm[msymbol].astype(str).str.upper().str.replace(r"[^A-Z0-9]", "", regex=True)
+    ex = dm[segment].astype(str).str.upper().str.strip()
+    allowed_exchange = {"NSE", "NSE_EQ", "NSE EQUITY"}
+    dm = dm[ex.isin(allowed_exchange)]
+    if market:
+        market_values = dm[market].astype(str).str.upper().str.strip()
+        dm = dm[market_values.isin({"E", "EQUITY", "NSE_EQ", "NSE EQUITY", "NA", "NAN"})]
     dm["security_id"] = pd.to_numeric(dm[sid], errors="coerce")
-    frame["key"] = frame.stock.str.replace(r"[^A-Z0-9]", "", regex=True)
-    dm = dm.dropna(subset=["security_id"]).drop_duplicates("key")[["key", "security_id"]]
-    result = frame[["stock", "sector", "key"]].merge(dm, on="key", how="inner")
-    result["security_id"] = result.security_id.astype(int)
+    dm["exact_key"] = dm[msymbol].astype(str).str.upper().str.strip()
+    dm["key"] = dm[msymbol].map(clean_key)
+    frame["exact_key"] = frame.stock.astype(str).str.upper().str.strip()
+    frame["key"] = frame.stock.map(clean_key)
+    dm = dm.dropna(subset=["security_id"])
+    exact = dm.drop_duplicates("exact_key")[["exact_key", "security_id"]]
+    result = frame[["stock", "sector", "exact_key", "key"]].merge(exact, on="exact_key", how="left")
+    missing = result["security_id"].isna()
+    fallback = dm.drop_duplicates("key")[["key", "security_id"]]
+    result.loc[missing, "security_id"] = result.loc[missing, ["key"]].merge(fallback, on="key", how="left")["security_id_y"].to_numpy()
+    result = result.dropna(subset=["security_id"])
+    result["security_id"] = result["security_id"].astype(int)
     result = result[["stock", "sector", "security_id"]].drop_duplicates("stock").sort_values("stock").reset_index(drop=True)
     if len(result) < 120:
         raise RuntimeError(f"Only {len(result)} stocks mapped; too many missing")
@@ -115,11 +129,15 @@ def load_universe():
 def live_quotes(ids):
     response = retry_request("POST", QUOTE_URL, headers=headers(), json={"NSE_EQ": sorted({int(x) for x in ids})}, timeout=60)
     response.raise_for_status()
+    payload = response.json()
     out = {}
-    for segment, items in (response.json().get("data") or {}).items():
+    for segment, items in (payload.get("data") or {}).items():
         for sid, quote in (items or {}).items():
-            ohlc = (quote or {}).get("ohlc") or {}
-            out[(segment, str(sid))] = {"LTP": (quote or {}).get("last_price"), "Today's Open": ohlc.get("open"), "Today's Low": ohlc.get("low"), "Today's High": ohlc.get("high")}
+            quote = quote or {}
+            ohlc = quote.get("ohlc") or {}
+            out[(segment, str(sid))] = {"LTP": quote.get("last_price"), "Today's Open": ohlc.get("open"), "Today's Low": ohlc.get("low"), "Today's High": ohlc.get("high")}
+    if not out:
+        raise RuntimeError(f"Dhan returned no quote data: {payload}")
     return out
 
 
@@ -127,26 +145,30 @@ def previous_ohlc(sid, start, end):
     payload = {"securityId": str(int(sid)), "exchangeSegment": "NSE_EQ", "instrument": "EQUITY", "expiryCode": 0, "oi": False, "fromDate": start, "toDate": end}
     response = retry_request("POST", HISTORY_URL, headers=headers(), json=payload, timeout=30)
     response.raise_for_status()
-    data = response.json().get("data") or {}
+    raw = response.json().get("data") or {}
     fields = ["timestamp", "close", "high", "low"]
-    if not isinstance(data, dict) or not all(field in data for field in fields):
+    if not isinstance(raw, dict) or not all(field in raw for field in fields):
         return {"PDC": None, "PDH": None, "PDL": None}
-    candles = pd.DataFrame({field: pd.to_numeric(data[field], errors="coerce") for field in fields}).dropna().sort_values("timestamp")
+    candles = pd.DataFrame({field: pd.to_numeric(raw[field], errors="coerce") for field in fields}).dropna().sort_values("timestamp")
     if candles.empty:
         return {"PDC": None, "PDH": None, "PDL": None}
-    unit = "ms" if candles.timestamp.abs().max() > 10_000_000_000 else "s"
-    candles["trade_date"] = pd.to_datetime(candles.timestamp, unit=unit, utc=True, errors="coerce").dt.tz_convert(IST).dt.date
-    completed = candles[candles.trade_date < datetime.now(IST).date()]
+    unit = "ms" if candles["timestamp"].abs().max() > 10_000_000_000 else "s"
+    candles["trade_date"] = pd.to_datetime(candles["timestamp"], unit=unit, utc=True, errors="coerce").dt.tz_convert(IST).dt.date
+    previous_day = datetime.now(IST).date() - timedelta(days=1)
+    completed = candles[candles["trade_date"] < datetime.now(IST).date()]
     if completed.empty:
         return {"PDC": None, "PDH": None, "PDL": None}
-    candle = completed.iloc[-1]
-    return {"PDC": float(candle.close), "PDH": float(candle.high), "PDL": float(candle.low)}
+    if previous_day in set(completed["trade_date"]):
+        candle = completed[completed["trade_date"] == previous_day].iloc[-1]
+    else:
+        candle = completed.iloc[-1]
+    return {"PDC": float(candle["close"]), "PDH": float(candle["high"]), "PDL": float(candle["low"])}
 
 
 @st.cache_data(ttl=86400, show_spinner=False)
 def load_history(ids, start, end):
     result, failures = {}, []
-    progress = st.progress(0, text="Loading historical data once for today...")
+    progress = st.progress(0, text="Loading previous-day OHLC once for today...")
     for index, sid in enumerate(ids, 1):
         try:
             result[int(sid)] = previous_ohlc(sid, start, end)
@@ -158,38 +180,29 @@ def load_history(ids, start, end):
     return result, failures
 
 
-def calculate(data):
-    for field in ["LTP", "PDC", "PDH", "PDL", "Today's Low", "Today's High"]:
-        data[field] = pd.to_numeric(data.get(field, pd.Series(index=data.index)), errors="coerce")
-    valid = data["LTP"].notna() & data["PDC"].notna()
+def calculate(data, live_is_fresh=True):
+    numeric_fields = ["LTP", "PDC", "PDH", "PDL", "Today's Low", "Today's High"]
+    for field in numeric_fields:
+        data[field] = pd.to_numeric(data.get(field, pd.Series(index=data.index, dtype=float)), errors="coerce")
+    valid = data["LTP"].notna() & data["PDC"].notna() & data["PDH"].notna() & data["PDL"].notna()
     up = (valid & data["LTP"].gt(data["PDC"])).groupby(data["Sector"]).transform("sum")
     down = (valid & data["LTP"].lt(data["PDC"])).groupby(data["Sector"]).transform("sum")
-    ratio = up.div(down.replace(0, pd.NA)).mask((up > 0) & (down == 0), float("inf")).mask((up == 0) & (down > 0), 0).mask((up == 0) & (down == 0), pd.NA)
+    ratio = up.div(down.replace(0, pd.NA))
+    ratio = ratio.mask((up > 0) & (down == 0), float("inf"))
+    ratio = ratio.mask((up == 0) & (down == 0), pd.NA)
     data["Sector A/D Ratio"] = ratio
     data["Sector Bias"] = ratio.map(lambda x: "🟢 Bullish" if pd.notna(x) and x > 1 else "🔴 Bearish" if pd.notna(x) and x < 1 else "⚪ Neutral" if pd.notna(x) else "N/A")
     good = data["PDC"].gt(0)
     data["PDC to PDH %"] = ((data["PDH"] - data["PDC"]) / data["PDC"] * 100).where(good)
     data["PDC to PDL %"] = ((data["PDC"] - data["PDL"]) / data["PDC"] * 100).where(good)
-
-    # Green: price crossed yesterday's high with a bullish sector and a tight PDC-PDH range.
-    data["Green Signal"] = (
-        data["Today's High"].gt(data["PDH"])
-        & data["Today's Low"].lt(data["PDH"])
-        & data["LTP"].gt(data["PDH"])
-        & data["Sector A/D Ratio"].gt(1)
-        & data["PDC to PDH %"].le(0.15)
-    )
-    # Red: price crossed yesterday's low with a bearish sector and a tight PDC-PDL range.
-    data["Red Signal"] = (
-        data["Today's Low"].lt(data["PDL"])
-        & data["Today's High"].gt(data["PDL"])
-        & data["LTP"].lt(data["PDL"])
-        & data["Sector A/D Ratio"].lt(1)
-        & data["PDC to PDL %"].le(0.15)
-    )
+    tight_up = data["PDC to PDH %"].between(0, 0.15, inclusive="both")
+    tight_down = data["PDC to PDL %"].between(0, 0.15, inclusive="both")
+    data["Green Signal"] = valid & live_is_fresh & data["Today's High"].gt(data["PDH"]) & data["Today's Low"].lt(data["PDH"]) & data["LTP"].gt(data["PDH"]) & data["Sector A/D Ratio"].gt(1) & tight_up
+    data["Red Signal"] = valid & live_is_fresh & data["Today's Low"].lt(data["PDL"]) & data["Today's High"].gt(data["PDL"]) & data["LTP"].lt(data["PDL"]) & data["Sector A/D Ratio"].lt(1) & tight_down
     data["Signal"] = ""
     data.loc[data["Green Signal"], "Signal"] = "🟢 BUY"
     data.loc[data["Red Signal"], "Signal"] = "🔴 SELL"
+    data["Signal Priority"] = data["Signal"].map({"🟢 BUY": 0, "🔴 SELL": 1, "": 2}).fillna(3)
     return data
 
 
@@ -205,40 +218,39 @@ def render():
     if failures:
         with st.expander(f"Historical data warnings ({len(failures)})"):
             st.code("\n".join(failures[:50]))
-    quotes, quote_error = {}, None
+    quote_error, live_is_fresh = None, False
     if market_open(now):
         try:
             quotes = live_quotes(ids)
             st.session_state.last_live_quotes = quotes
             st.session_state.quote_time = now
         except Exception as exc:
-            quote_error = str(exc)
+            quote_error = f"Live quote error: {exc}"
     else:
-        quote_error = "Market is closed; showing the last successful quote snapshot."
-    if quote_error:
-        st.warning(quote_error)
+        quote_error = "Market is closed; live signals are disabled."
     live = st.session_state.get("last_live_quotes", {})
     quote_time = st.session_state.get("quote_time")
     if quote_time:
-        st.caption(f"Quote snapshot: {quote_time.strftime('%Y-%m-%d %H:%M:%S %Z')} ({int((now - quote_time).total_seconds() // 60)} min old)")
+        age = max(0, int((now - quote_time).total_seconds() // 60))
+        live_is_fresh = age <= MAX_QUOTE_AGE_MINUTES and market_open(now)
+        st.caption(f"Quote snapshot: {quote_time.strftime('%Y-%m-%d %H:%M:%S %Z')} ({age} min old)")
+    if quote_error:
+        st.warning(quote_error)
     rows = []
     for record in stocks.to_dict("records"):
         sid = int(record["security_id"])
-        quote, old = live.get(("NSE_EQ", str(sid)), {}), history.get(sid, {})
+        quote = live.get(("NSE_EQ", str(sid)), {})
+        old = history.get(sid, {})
         rows.append({"Stock": record["stock"], "Sector": record["sector"], **{k: quote.get(k) for k in ["LTP", "Today's Open", "Today's Low", "Today's High"]}, **{k: old.get(k) for k in ["PDC", "PDH", "PDL"]}})
-    data = calculate(pd.DataFrame(rows))
+    data = calculate(pd.DataFrame(rows), live_is_fresh=live_is_fresh)
     columns = ["Signal", "Stock", "Sector", "Sector A/D Ratio", "Sector Bias", "LTP", "Today's Open", "Today's Low", "Today's High", "PDC", "PDH", "PDL", "PDC to PDH %", "PDC to PDL %"]
     st.metric("Stocks scanned", len(data))
-    st.dataframe(
-        data.reindex(columns=columns).sort_values(["Signal", "Sector", "Stock"], ascending=[False, True, True]),
-        use_container_width=True,
-        hide_index=True,
-    )
-    st.caption("🟢 BUY = today's high > PDH, today's low < PDH, LTP > PDH, sector A/D > 1, and PDC-to-PDH ≤ 0.15%. 🔴 SELL is the symmetrical PDL rule.")
+    st.dataframe(data.reindex(columns=columns).sort_values(["Signal Priority", "Sector", "Stock"]), use_container_width=True, hide_index=True)
+    st.caption("Signals are enabled only during market hours with a quote snapshot no older than 5 minutes.")
 
 
 st.title("📈 Nifty Midcap 150 Stock Scanner")
-st.caption("Batched live quotes, retry protection, and completed-day OHLC.")
+st.caption("Nifty Midcap 150 • Dhan live quotes • previous-day OHLC • sector breadth")
 try:
     if hasattr(st, "fragment"):
         st.fragment(run_every="30s")(render)()
