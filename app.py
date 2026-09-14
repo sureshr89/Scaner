@@ -1,7 +1,6 @@
 import os
 import re
 import time
-from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, time as dt_time, timedelta
 from io import StringIO
 from zoneinfo import ZoneInfo
@@ -17,9 +16,15 @@ st.set_page_config(
     layout="wide",
 )
 
+
 REFRESH_SECONDS = 15
 
+# Wait between Dhan historical API calls.
+# Increase this to 2 or 3 if Dhan still returns HTTP 429.
+HISTORICAL_DELAY_SECONDS = 1.2
+
 QUOTE_URL = "https://api.dhan.co/v2/marketfeed/ohlc"
+
 HISTORY_URL = "https://api.dhan.co/v2/charts/historical"
 
 NSE_URL = (
@@ -280,6 +285,7 @@ def download_nifty500():
                     ]
                 )
             ]
+
     else:
         dm = dm[
             exchange_values.eq("NSE_EQ")
@@ -447,102 +453,152 @@ def historical_one(
         "toDate": end,
     }
 
-    try:
-        response = requests.post(
-            HISTORY_URL,
-            headers=headers(),
-            json=payload,
-            timeout=30,
-        )
+    max_retries = 5
 
-        if not response.ok:
+    for attempt in range(max_retries):
+        try:
+            response = requests.post(
+                HISTORY_URL,
+                headers=headers(),
+                json=payload,
+                timeout=30,
+            )
+
+            if response.status_code == 429:
+                wait_seconds = 10 * (attempt + 1)
+
+                time.sleep(
+                    wait_seconds
+                )
+
+                if attempt == max_retries - 1:
+                    return {
+                        "pdc": None,
+                        "pdh": None,
+                        "pdl": None,
+                        "error": (
+                            "HTTP 429: Dhan rate limit. "
+                            "Please try again later."
+                        ),
+                    }
+
+                continue
+
+            if not response.ok:
+                return {
+                    "pdc": None,
+                    "pdh": None,
+                    "pdl": None,
+                    "error": (
+                        f"HTTP {response.status_code}: "
+                        f"{response.text[:250]}"
+                    ),
+                }
+
+            body = response.json()
+
+            data = (
+                body.get("data") or body
+                if isinstance(body, dict)
+                else {}
+            )
+
+            fields = [
+                "timestamp",
+                "close",
+                "high",
+                "low",
+            ]
+
+            if (
+                not isinstance(data, dict)
+                or any(
+                    field not in data
+                    for field in fields
+                )
+            ):
+                return {
+                    "pdc": None,
+                    "pdh": None,
+                    "pdl": None,
+                    "error": (
+                        "Missing historical candle fields"
+                    ),
+                }
+
+            frame = pd.DataFrame(
+                {
+                    field: data[field]
+                    for field in fields
+                }
+            )
+
+            for field in fields:
+                frame[field] = pd.to_numeric(
+                    frame[field],
+                    errors="coerce",
+                )
+
+            frame = (
+                frame.dropna(
+                    subset=fields
+                )
+                .sort_values("timestamp")
+            )
+
+            if frame.empty:
+                return {
+                    "pdc": None,
+                    "pdh": None,
+                    "pdl": None,
+                    "error": (
+                        "No valid historical candles"
+                    ),
+                }
+
+            row = frame.iloc[-1]
+
+            return {
+                "pdc": float(row["close"]),
+                "pdh": float(row["high"]),
+                "pdl": float(row["low"]),
+                "error": None,
+            }
+
+        except requests.exceptions.RequestException as exc:
+            if attempt == max_retries - 1:
+                return {
+                    "pdc": None,
+                    "pdh": None,
+                    "pdl": None,
+                    "error": str(exc),
+                }
+
+            time.sleep(
+                5 * (attempt + 1)
+            )
+
+        except Exception as exc:
             return {
                 "pdc": None,
                 "pdh": None,
                 "pdl": None,
-                "error": (
-                    f"HTTP {response.status_code}: "
-                    f"{response.text[:250]}"
-                ),
+                "error": str(exc),
             }
 
-        body = response.json()
-
-        data = (
-            body.get("data") or body
-            if isinstance(body, dict)
-            else {}
-        )
-
-        fields = [
-            "timestamp",
-            "close",
-            "high",
-            "low",
-        ]
-
-        if (
-            not isinstance(data, dict)
-            or any(
-                field not in data
-                for field in fields
-            )
-        ):
-            return {
-                "pdc": None,
-                "pdh": None,
-                "pdl": None,
-                "error": "Missing historical candle fields",
-            }
-
-        frame = pd.DataFrame(
-            {
-                field: data[field]
-                for field in fields
-            }
-        )
-
-        for field in fields:
-            frame[field] = pd.to_numeric(
-                frame[field],
-                errors="coerce",
-            )
-
-        frame = (
-            frame.dropna(
-                subset=fields
-            )
-            .sort_values("timestamp")
-        )
-
-        if frame.empty:
-            return {
-                "pdc": None,
-                "pdh": None,
-                "pdl": None,
-                "error": "No valid historical candles",
-            }
-
-        row = frame.iloc[-1]
-
-        return {
-            "pdc": float(row["close"]),
-            "pdh": float(row["high"]),
-            "pdl": float(row["low"]),
-            "error": None,
-        }
-
-    except Exception as exc:
-        return {
-            "pdc": None,
-            "pdh": None,
-            "pdl": None,
-            "error": str(exc),
-        }
+    return {
+        "pdc": None,
+        "pdh": None,
+        "pdl": None,
+        "error": "Historical request failed",
+    }
 
 
-# Faster than calling 500 historical requests one by one.
-def historical(stocks, now):
+@st.cache_data(ttl=86400, show_spinner=False)
+def historical(
+    stocks,
+    now,
+):
     start = (
         now.date()
         - timedelta(days=30)
@@ -557,50 +613,35 @@ def historical(stocks, now):
 
     results = {}
 
+    total = len(security_ids)
+
     progress = st.progress(
         0,
         text="Loading historical PDC/PDH/PDL data...",
     )
 
-    with ThreadPoolExecutor(
-        max_workers=8
-    ) as executor:
+    for index, security_id in enumerate(
+        security_ids,
+        start=1,
+    ):
+        results[security_id] = historical_one(
+            security_id,
+            start,
+            end,
+        )
 
-        futures = {
-            executor.submit(
-                historical_one,
-                security_id,
-                start,
-                end,
-            ): security_id
-            for security_id in security_ids
-        }
+        progress.progress(
+            index / total,
+            text=(
+                "Loading historical data: "
+                f"{index}/{total}"
+            ),
+        )
 
-        completed = 0
-
-        for future in as_completed(futures):
-            security_id = futures[future]
-
-            try:
-                results[security_id] = future.result()
-
-            except Exception as exc:
-                results[security_id] = {
-                    "pdc": None,
-                    "pdh": None,
-                    "pdl": None,
-                    "error": str(exc),
-                }
-
-            completed += 1
-
-            progress.progress(
-                completed / len(security_ids),
-                text=(
-                    "Loading historical data: "
-                    f"{completed}/{len(security_ids)}"
-                ),
-            )
+        # Important: one request at a time.
+        time.sleep(
+            HISTORICAL_DELAY_SECONDS
+        )
 
     progress.empty()
 
@@ -786,7 +827,6 @@ def calculate(frame):
     return df
 
 
-# Adds only one extra column to each watchlist.
 def table(df, kind):
     level = (
         "PDH"
