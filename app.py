@@ -32,7 +32,10 @@ REFRESH_SECONDS = 15
 HISTORY_CACHE_TTL = 86400
 
 # Delay between historical requests during the first load.
-HISTORY_REQUEST_DELAY = 0.5
+HISTORY_REQUEST_DELAY = 0.0
+
+# Small parallel batch size: faster startup without flooding Dhan.
+HISTORY_WORKERS = 5
 
 QUOTE_URL = "https://api.dhan.co/v2/marketfeed/ohlc"
 HISTORY_URL = "https://api.dhan.co/v2/charts/historical"
@@ -650,47 +653,34 @@ def historical_one(
     ttl=HISTORY_CACHE_TTL,
     show_spinner=False,
 )
-def historical(
-    stocks_key,
-    start,
-    end,
-):
+def historical(stocks_key, start, end, refresh_key):
+    """Load historical values once per refresh_key, in parallel."""
+    from concurrent.futures import ThreadPoolExecutor, as_completed
+
     result = {}
-
     total = len(stocks_key)
+    progress = st.progress(0, text="Loading historical data...")
 
-    progress = st.progress(
-        0,
-        text="Loading historical data...",
-    )
+    def fetch_one(security_id):
+        return int(security_id), historical_one(security_id, start, end)
 
-    for position, security_id in enumerate(
-        stocks_key,
-        start=1,
-    ):
-        result[int(security_id)] = (
-            historical_one(
-                security_id,
-                start,
-                end,
+    completed = 0
+    with ThreadPoolExecutor(max_workers=HISTORY_WORKERS) as executor:
+        futures = {
+            executor.submit(fetch_one, security_id): security_id
+            for security_id in stocks_key
+        }
+
+        for future in as_completed(futures):
+            security_id, values = future.result()
+            result[security_id] = values
+            completed += 1
+            progress.progress(
+                completed / total if total else 1.0,
+                text=f"Historical data: {completed}/{total}",
             )
-        )
-
-        progress.progress(
-            position / total,
-            text=(
-                f"Historical data: "
-                f"{position}/{total}"
-            ),
-        )
-
-        # Prevent sending all historical calls instantly.
-        time.sleep(
-            HISTORY_REQUEST_DELAY
-        )
 
     progress.empty()
-
     return result
 
 
@@ -1034,6 +1024,13 @@ st.caption(
 
 now = datetime.now(IST)
 
+# Change the cache key once per trading day at 09:00 IST.
+# This refreshes historical values once and leaves live data independent.
+if now.weekday() < 5 and now.time() >= dt_time(9, 0):
+    refresh_key = now.date().isoformat()
+else:
+    refresh_key = "pre-open-" + now.date().isoformat()
+
 opened = market_open(now)
 
 st.info(
@@ -1050,12 +1047,18 @@ st.info(
 try:
     stocks = load_stocks()
 
+    # Use the most recent completed weekday.
+    # This prevents today's incomplete candle being used as PDC/PDH/PDL.
+    end_date = now.date() - timedelta(days=1)
+    while end_date.weekday() >= 5:
+        end_date -= timedelta(days=1)
+
     start = (
-        now.date()
+        end_date
         - timedelta(days=30)
     ).isoformat()
 
-    end = now.date().isoformat()
+    end = end_date.isoformat()
 
     # Stable tuple used by Streamlit cache.
     # Historical function will run once per cache period.
@@ -1074,6 +1077,7 @@ try:
         stocks_key,
         start,
         end,
+        refresh_key,
     )
 
     # This is the only Dhan request repeated
@@ -1195,8 +1199,13 @@ except Exception as exc:
 # REFRESH ONLY LIVE DATA
 # ============================================================
 
-time.sleep(
-    REFRESH_SECONDS
-)
+try:
+    from streamlit_autorefresh import st_autorefresh
 
-st.rerun()
+    st_autorefresh(
+        interval=REFRESH_SECONDS * 1000,
+        key="dhan_live_refresh",
+    )
+except ImportError:
+    time.sleep(REFRESH_SECONDS)
+    st.rerun()
