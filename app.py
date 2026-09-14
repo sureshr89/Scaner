@@ -1,9 +1,10 @@
 import os
+import re
 import time
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, time as dt_time, timedelta
 from io import StringIO
 from zoneinfo import ZoneInfo
-import re
 
 import pandas as pd
 import requests
@@ -42,16 +43,20 @@ def secret(name):
 
 
 def headers():
-    if not secret("DHAN_ACCESS_TOKEN") or not secret("DHAN_CLIENT_ID"):
+    access_token = secret("DHAN_ACCESS_TOKEN")
+    client_id = secret("DHAN_CLIENT_ID")
+
+    if not access_token or not client_id:
         raise RuntimeError(
-            "Add DHAN_CLIENT_ID and DHAN_ACCESS_TOKEN in Streamlit Secrets."
+            "Add DHAN_CLIENT_ID and DHAN_ACCESS_TOKEN "
+            "in Streamlit Secrets."
         )
 
     return {
         "Accept": "application/json",
         "Content-Type": "application/json",
-        "access-token": secret("DHAN_ACCESS_TOKEN"),
-        "client-id": secret("DHAN_CLIENT_ID"),
+        "access-token": access_token,
+        "client-id": client_id,
     }
 
 
@@ -65,8 +70,8 @@ def norm(value):
 
 def first_column(frame, names):
     lookup = {
-        str(c).lower().replace(" ", "_"): c
-        for c in frame.columns
+        str(column).lower().replace(" ", "_"): column
+        for column in frame.columns
     }
 
     for name in names:
@@ -176,13 +181,14 @@ def download_nifty500():
         ],
     )
 
-    nse["sector"] = (
-        nse[sector_col]
-        .astype(str)
-        .str.strip()
-        if sector_col
-        else "UNKNOWN"
-    )
+    if sector_col:
+        nse["sector"] = (
+            nse[sector_col]
+            .astype(str)
+            .str.strip()
+        )
+    else:
+        nse["sector"] = "UNKNOWN"
 
     nse["join_key"] = nse["stock"].map(norm)
 
@@ -274,7 +280,6 @@ def download_nifty500():
                     ]
                 )
             ]
-
     else:
         dm = dm[
             exchange_values.eq("NSE_EQ")
@@ -358,7 +363,7 @@ def load_stocks():
             ]
         ).copy()
 
-        st.error(
+        st.warning(
             "Nifty 500 loading failed; "
             f"using only {len(fallback)} local stocks. "
             f"Details: {exc}"
@@ -383,8 +388,8 @@ def dhan_snapshot(stocks):
         json={
             "NSE_EQ": sorted(
                 {
-                    int(x)
-                    for x in stocks.security_id
+                    int(security_id)
+                    for security_id in stocks.security_id
                 }
             )
         },
@@ -487,9 +492,7 @@ def historical_one(
                 "pdc": None,
                 "pdh": None,
                 "pdl": None,
-                "error": (
-                    "Missing historical candle fields"
-                ),
+                "error": "Missing historical candle fields",
             }
 
         frame = pd.DataFrame(
@@ -517,9 +520,7 @@ def historical_one(
                 "pdc": None,
                 "pdh": None,
                 "pdl": None,
-                "error": (
-                    "No valid historical candles"
-                ),
+                "error": "No valid historical candles",
             }
 
         row = frame.iloc[-1]
@@ -540,6 +541,7 @@ def historical_one(
         }
 
 
+# Faster than calling 500 historical requests one by one.
 def historical(stocks, now):
     start = (
         now.date()
@@ -548,14 +550,61 @@ def historical(stocks, now):
 
     end = now.date().isoformat()
 
-    return {
-        int(sid): historical_one(
-            sid,
-            start,
-            end,
-        )
-        for sid in stocks.security_id
-    }
+    security_ids = [
+        int(security_id)
+        for security_id in stocks.security_id
+    ]
+
+    results = {}
+
+    progress = st.progress(
+        0,
+        text="Loading historical PDC/PDH/PDL data...",
+    )
+
+    with ThreadPoolExecutor(
+        max_workers=8
+    ) as executor:
+
+        futures = {
+            executor.submit(
+                historical_one,
+                security_id,
+                start,
+                end,
+            ): security_id
+            for security_id in security_ids
+        }
+
+        completed = 0
+
+        for future in as_completed(futures):
+            security_id = futures[future]
+
+            try:
+                results[security_id] = future.result()
+
+            except Exception as exc:
+                results[security_id] = {
+                    "pdc": None,
+                    "pdh": None,
+                    "pdl": None,
+                    "error": str(exc),
+                }
+
+            completed += 1
+
+            progress.progress(
+                completed / len(security_ids),
+                text=(
+                    "Loading historical data: "
+                    f"{completed}/{len(security_ids)}"
+                ),
+            )
+
+    progress.empty()
+
+    return results
 
 
 def build_frame(
@@ -568,19 +617,19 @@ def build_frame(
     for record in stocks.to_dict(
         "records"
     ):
-        sid = int(
+        security_id = int(
             record["security_id"]
         )
 
-        h = history.get(
-            sid,
+        historical_data = history.get(
+            security_id,
             {},
         )
 
-        q = live.get(
+        quote = live.get(
             (
                 "NSE_EQ",
-                str(sid),
+                str(security_id),
             ),
             {},
         )
@@ -589,14 +638,14 @@ def build_frame(
             {
                 "Stock": record["stock"],
                 "Sector": record["sector"],
-                "LTP": q.get("ltp"),
-                "PDC": h.get("pdc"),
-                "PDH": h.get("pdh"),
-                "PDL": h.get("pdl"),
-                "Today's Open": q.get("open"),
-                "Today's Low": q.get("low"),
-                "Today's High": q.get("high"),
-                "History Error": h.get("error"),
+                "LTP": quote.get("ltp"),
+                "PDC": historical_data.get("pdc"),
+                "PDH": historical_data.get("pdh"),
+                "PDL": historical_data.get("pdl"),
+                "Today's Open": quote.get("open"),
+                "Today's Low": quote.get("low"),
+                "Today's High": quote.get("high"),
+                "History Error": historical_data.get("error"),
             }
         )
 
@@ -609,7 +658,7 @@ def calculate(frame):
     if df.empty:
         return df
 
-    numeric = [
+    numeric_columns = [
         "LTP",
         "PDC",
         "PDH",
@@ -619,9 +668,9 @@ def calculate(frame):
         "Today's High",
     ]
 
-    for col in numeric:
-        df[col] = pd.to_numeric(
-            df[col],
+    for column in numeric_columns:
+        df[column] = pd.to_numeric(
+            df[column],
             errors="coerce",
         )
 
@@ -678,32 +727,22 @@ def calculate(frame):
 
     buy &= (
         (
-            (
-                df["PDH"]
-                - df["PDC"]
-            )
-            / df["PDC"]
-            * 100
+            df["PDH"]
+            - df["PDC"]
         )
+        / df["PDC"]
+        * 100
         <= 1
     )
 
     buy &= (
-        df["LTP"].gt(
-            df["PDH"]
-        )
-        & df["Sector LTP"].gt(
-            df["Sector PDC"]
-        )
+        df["LTP"].gt(df["PDH"])
+        & df["Sector LTP"].gt(df["Sector PDC"])
     )
 
     buy &= (
-        df["Today's Low"].lt(
-            df["PDH"]
-        )
-        & df["Today's High"].gt(
-            df["PDH"]
-        )
+        df["Today's Low"].lt(df["PDH"])
+        & df["Today's High"].gt(df["PDH"])
         & df["Sector AD"].gt(1)
     )
 
@@ -717,32 +756,22 @@ def calculate(frame):
 
     sell &= (
         (
-            (
-                df["PDC"]
-                - df["PDL"]
-            )
-            / df["PDC"]
-            * 100
+            df["PDC"]
+            - df["PDL"]
         )
+        / df["PDC"]
+        * 100
         <= 1
     )
 
     sell &= (
-        df["LTP"].lt(
-            df["PDL"]
-        )
-        & df["Sector LTP"].lt(
-            df["Sector PDC"]
-        )
+        df["LTP"].lt(df["PDL"])
+        & df["Sector LTP"].lt(df["Sector PDC"])
     )
 
     sell &= (
-        df["Today's High"].gt(
-            df["PDL"]
-        )
-        & df["Today's Low"].lt(
-            df["PDL"]
-        )
+        df["Today's High"].gt(df["PDL"])
+        & df["Today's Low"].lt(df["PDL"])
         & df["Sector AD"].lt(1)
     )
 
@@ -757,8 +786,7 @@ def calculate(frame):
     return df
 
 
-# ONLY THIS TABLE FUNCTION WAS CHANGED
-# Added one extra percentage-difference column.
+# Adds only one extra column to each watchlist.
 def table(df, kind):
     level = (
         "PDH"
@@ -811,23 +839,15 @@ def table(df, kind):
 
     if kind == "buy":
         distance = (
-            (
-                selected["PDH"]
-                - selected["PDC"]
-            )
-            / selected["PDC"]
-            * 100
-        )
+            selected["PDH"]
+            - selected["PDC"]
+        ) / selected["PDC"] * 100
 
     else:
         distance = (
-            (
-                selected["PDC"]
-                - selected["PDL"]
-            )
-            / selected["PDC"]
-            * 100
-        )
+            selected["PDC"]
+            - selected["PDL"]
+        ) / selected["PDC"] * 100
 
     selected["_distance"] = distance
 
@@ -890,9 +910,14 @@ try:
         )
     )
 
-    buys, sells = (
-        table(data, "buy"),
-        table(data, "sell"),
+    buys = table(
+        data,
+        "buy",
+    )
+
+    sells = table(
+        data,
+        "sell",
     )
 
     a, b, c = st.columns(3)
@@ -940,19 +965,31 @@ try:
         "🟢 BUY WATCHLIST"
     )
 
-    st.dataframe(
-        buys,
-        use_container_width=True,
-    )
+    if buys.empty:
+        st.info(
+            "No Buy signals currently. "
+            "Live market data is required after 9:15 AM IST."
+        )
+    else:
+        st.dataframe(
+            buys,
+            use_container_width=True,
+        )
 
     st.subheader(
         "🔴 SELL WATCHLIST"
     )
 
-    st.dataframe(
-        sells,
-        use_container_width=True,
-    )
+    if sells.empty:
+        st.info(
+            "No Sell signals currently. "
+            "Live market data is required after 9:15 AM IST."
+        )
+    else:
+        st.dataframe(
+            sells,
+            use_container_width=True,
+        )
 
     with st.expander(
         "All scanned stocks"
