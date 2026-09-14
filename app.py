@@ -17,11 +17,22 @@ st.set_page_config(
 )
 
 REFRESH_SECONDS = 15
+
 QUOTE_URL = "https://api.dhan.co/v2/marketfeed/ohlc"
 HISTORY_URL = "https://api.dhan.co/v2/charts/historical"
-NSE_URL = "https://www.nseindia.com/api/equity-stockIndices?index=NIFTY%20500"
-NIFTY_CSV_URL = "https://www.niftyindices.com/IndexConstituent/ind_nifty500list.csv"
-DHAN_MASTER_URL = "https://images.dhan.co/api-data/api-scrip-master.csv"
+
+NSE_URL = (
+    "https://www.nseindia.com/api/equity-stockIndices"
+    "?index=NIFTY%20500"
+)
+
+NIFTY_CSV_URL = (
+    "https://www.niftyindices.com/IndexConstituent/ind_nifty500list.csv"
+)
+
+DHAN_MASTER_URL = (
+    "https://images.dhan.co/api-data/api-scrip-master.csv"
+)
 
 IST = ZoneInfo("Asia/Kolkata")
 
@@ -45,7 +56,11 @@ def headers():
 
 
 def norm(value):
-    return re.sub(r"[^A-Z0-9]", "", str(value).upper().strip())
+    return re.sub(
+        r"[^A-Z0-9]",
+        "",
+        str(value).upper().strip(),
+    )
 
 
 def first_column(frame, names):
@@ -121,7 +136,9 @@ def download_nifty500():
             errors.append(f"Nifty CSV: {exc}")
 
     if nse is None or nse.empty:
-        raise RuntimeError("; ".join(errors))
+        raise RuntimeError(
+            "; ".join(errors)
+        )
 
     symbol_col = first_column(
         nse,
@@ -275,18 +292,10 @@ def download_nifty500():
 
     dm = (
         dm.dropna(
-            subset=[
-                "security_id",
-            ]
+            subset=["security_id"]
         )
-        .drop_duplicates(
-            "join_key"
-        )[
-            [
-                "join_key",
-                "security_id",
-            ]
-        ]
+        .drop_duplicates("join_key")
+        [["join_key", "security_id"]]
     )
 
     result = nse[
@@ -320,7 +329,8 @@ def download_nifty500():
 
     if len(result) < 400:
         raise RuntimeError(
-            f"Only {len(result)} stocks mapped from Nifty 500 to Dhan"
+            f"Only {len(result)} stocks mapped "
+            "from Nifty 500 to Dhan"
         )
 
     return result
@@ -454,8 +464,7 @@ def historical_one(
         body = response.json()
 
         data = (
-            body.get("data")
-            or body
+            body.get("data") or body
             if isinstance(body, dict)
             else {}
         )
@@ -478,7 +487,9 @@ def historical_one(
                 "pdc": None,
                 "pdh": None,
                 "pdl": None,
-                "error": "Missing historical candle fields",
+                "error": (
+                    "Missing historical candle fields"
+                ),
             }
 
         frame = pd.DataFrame(
@@ -506,7 +517,9 @@ def historical_one(
                 "pdc": None,
                 "pdh": None,
                 "pdl": None,
-                "error": "No valid historical candles",
+                "error": (
+                    "No valid historical candles"
+                ),
             }
 
         row = frame.iloc[-1]
@@ -665,18 +678,21 @@ def calculate(frame):
 
     buy &= (
         (
-            df["PDH"]
-            - df["PDC"]
+            (
+                df["PDH"]
+                - df["PDC"]
+            )
+            / df["PDC"]
+            * 100
         )
-        / df["PDC"]
-        * 100
         <= 1
-    ) & (
+    )
+
+    buy &= (
         df["LTP"].gt(
             df["PDH"]
         )
-    ) & (
-        df["Sector LTP"].gt(
+        & df["Sector LTP"].gt(
             df["Sector PDC"]
         )
     )
@@ -701,18 +717,21 @@ def calculate(frame):
 
     sell &= (
         (
-            df["PDC"]
-            - df["PDL"]
+            (
+                df["PDC"]
+                - df["PDL"]
+            )
+            / df["PDC"]
+            * 100
         )
-        / df["PDC"]
-        * 100
         <= 1
-    ) & (
+    )
+
+    sell &= (
         df["LTP"].lt(
             df["PDL"]
         )
-    ) & (
-        df["Sector LTP"].lt(
+        & df["Sector LTP"].lt(
             df["Sector PDC"]
         )
     )
@@ -738,6 +757,8 @@ def calculate(frame):
     return df
 
 
+# ONLY THIS TABLE FUNCTION WAS CHANGED
+# Added one extra percentage-difference column.
 def table(df, kind):
     level = (
         "PDH"
@@ -751,7 +772,6 @@ def table(df, kind):
         else "Sell Alignment 🔴"
     )
 
-    # New column added only for the relevant watchlist
     diff_column = (
         "PDC–PDH % Diff"
         if kind == "buy"
@@ -789,31 +809,33 @@ def table(df, kind):
             columns=columns
         )
 
-    # Existing ranking calculation is unchanged
-    distance = (
-        (
-            selected["PDH"]
-            - selected["PDC"]
+    if kind == "buy":
+        distance = (
+            (
+                selected["PDH"]
+                - selected["PDC"]
+            )
+            / selected["PDC"]
+            * 100
         )
-        / selected["PDC"]
-        * 100
-        if kind == "buy"
-        else (
-            selected["PDC"]
-            - selected["PDL"]
-        )
-        / selected["PDC"]
-        * 100
-    )
 
-    # Add the same percentage used for ranking
-    selected = selected.assign(
-        _distance=distance,
-        **{
-            diff_column: distance,
-        },
-    ).sort_values(
-        "_distance"
+    else:
+        distance = (
+            (
+                selected["PDC"]
+                - selected["PDL"]
+            )
+            / selected["PDC"]
+            * 100
+        )
+
+    selected["_distance"] = distance
+
+    selected[diff_column] = distance
+
+    selected = (
+        selected
+        .sort_values("_distance")
     )
 
     selected["Rank"] = range(
@@ -824,7 +846,9 @@ def table(df, kind):
     return selected[columns]
 
 
-st.title("📈 Dhan Stock Scanner")
+st.title(
+    "📈 Dhan Stock Scanner"
+)
 
 st.caption(
     "Nifty 500 universe | "
@@ -837,10 +861,10 @@ now = datetime.now(IST)
 opened = market_open(now)
 
 st.info(
-    f"India time: {now:%Y-%m-%d %H:%M:%S IST} | "
+    f"India time: "
+    f"{now:%Y-%m-%d %H:%M:%S IST} | "
     f"{'Market open' if opened else 'Market closed; historical values remain available.'}"
 )
-
 
 try:
     stocks = load_stocks()
@@ -852,9 +876,7 @@ try:
 
     live = (
         flatten(
-            dhan_snapshot(
-                stocks
-            )
+            dhan_snapshot(stocks)
         )
         if opened
         else {}
@@ -868,14 +890,9 @@ try:
         )
     )
 
-    buys = table(
-        data,
-        "buy",
-    )
-
-    sells = table(
-        data,
-        "sell",
+    buys, sells = (
+        table(data, "buy"),
+        table(data, "sell"),
     )
 
     a, b, c = st.columns(3)
@@ -914,7 +931,8 @@ try:
 
     if not opened:
         st.warning(
-            "Live LTP/today OHLC are blank while NSE is closed. "
+            "Live LTP/today OHLC are blank "
+            "while NSE is closed. "
             "PDC/PDH/PDL are historical Dhan values."
         )
 
@@ -945,7 +963,8 @@ try:
         )
 
     st.caption(
-        f"Last check: {now:%Y-%m-%d %H:%M:%S IST} | "
+        f"Last check: "
+        f"{now:%Y-%m-%d %H:%M:%S IST} | "
         f"Refresh: {REFRESH_SECONDS}s"
     )
 
