@@ -1,15 +1,19 @@
 import os
 import time
-import re
 from datetime import datetime, time as dt_time, timedelta
 from io import StringIO
 from zoneinfo import ZoneInfo
-from concurrent.futures import ThreadPoolExecutor, as_completed
+from pathlib import Path
+import re
 
 import pandas as pd
 import requests
 import streamlit as st
 
+
+# ============================================================
+# PAGE SETTINGS
+# ============================================================
 
 st.set_page_config(
     page_title="Dhan Stock Scanner",
@@ -17,34 +21,71 @@ st.set_page_config(
     layout="wide",
 )
 
-REFRESH_SECONDS = 60
+
+# ============================================================
+# SETTINGS
+# ============================================================
+
+REFRESH_SECONDS = 15
+
+# Historical data is cached for 24 hours.
+HISTORY_CACHE_TTL = 86400
+
+# Delay between historical requests during the first load.
+HISTORY_REQUEST_DELAY = 0.5
 
 QUOTE_URL = "https://api.dhan.co/v2/marketfeed/ohlc"
 HISTORY_URL = "https://api.dhan.co/v2/charts/historical"
-NSE_URL = "https://www.nseindia.com/api/equity-stockIndices?index=NIFTY%20500"
-NIFTY_CSV_URL = "https://www.niftyindices.com/IndexConstituent/ind_nifty500list.csv"
-DHAN_MASTER_URL = "https://images.dhan.co/api-data/api-scrip-master.csv"
+
+NSE_URL = (
+    "https://www.nseindia.com/api/equity-stockIndices"
+    "?index=NIFTY%20500"
+)
+
+NIFTY_CSV_URL = (
+    "https://www.niftyindices.com/IndexConstituent/"
+    "ind_nifty500list.csv"
+)
+
+DHAN_MASTER_URL = (
+    "https://images.dhan.co/api-data/api-scrip-master.csv"
+)
 
 IST = ZoneInfo("Asia/Kolkata")
 
 
+# ============================================================
+# DHAN CREDENTIALS
+# ============================================================
+
 def secret(name):
-    return os.getenv(name) or st.secrets.get(name, "")
+    try:
+        return os.getenv(name) or st.secrets.get(name, "")
+    except Exception:
+        return os.getenv(name, "")
 
 
 def headers():
-    if not secret("DHAN_ACCESS_TOKEN") or not secret("DHAN_CLIENT_ID"):
+    client_id = secret("DHAN_CLIENT_ID")
+    access_token = secret("DHAN_ACCESS_TOKEN")
+
+    if not client_id or not access_token:
         raise RuntimeError(
-            "Add DHAN_CLIENT_ID and DHAN_ACCESS_TOKEN in Streamlit Secrets."
+            "Add DHAN_CLIENT_ID and DHAN_ACCESS_TOKEN "
+            "in Streamlit Secrets."
         )
 
     return {
         "Accept": "application/json",
         "Content-Type": "application/json",
-        "access-token": secret("DHAN_ACCESS_TOKEN"),
-        "client-id": secret("DHAN_CLIENT_ID"),
+        "access-token": access_token,
+        "client-id": client_id,
     }
 
+
+# ============================================================
+# HELPERS
+# ============================================================
 
 def norm(value):
     return re.sub(
@@ -56,8 +97,8 @@ def norm(value):
 
 def first_column(frame, names):
     lookup = {
-        str(c).lower().replace(" ", "_"): c
-        for c in frame.columns
+        str(column).lower().replace(" ", "_"): column
+        for column in frame.columns
     }
 
     for name in names:
@@ -73,8 +114,10 @@ def universe_session():
     session.headers.update(
         {
             "User-Agent": (
-                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-                "AppleWebKit/537.36 Chrome/125 Safari/537.36"
+                "Mozilla/5.0 "
+                "(Windows NT 10.0; Win64; x64) "
+                "AppleWebKit/537.36 "
+                "Chrome/125 Safari/537.36"
             ),
             "Accept": "application/json,text/csv,*/*",
             "Referer": "https://www.nseindia.com/",
@@ -84,12 +127,18 @@ def universe_session():
     return session
 
 
+# ============================================================
+# LOAD NIFTY 500 STOCKS
+# ============================================================
+
 @st.cache_data(ttl=86400, show_spinner=False)
 def download_nifty500():
     session = universe_session()
+
     nse = None
     errors = []
 
+    # Try NSE API first.
     try:
         session.get(
             "https://www.nseindia.com/",
@@ -110,6 +159,7 @@ def download_nifty500():
     except Exception as exc:
         errors.append(f"NSE API: {exc}")
 
+    # Fallback to Nifty CSV.
     if nse is None or nse.empty:
         try:
             response = session.get(
@@ -141,7 +191,8 @@ def download_nifty500():
 
     if not symbol_col:
         raise RuntimeError(
-            f"No symbol column in Nifty data: {list(nse.columns)}"
+            "No symbol column in Nifty data: "
+            f"{list(nse.columns)}"
         )
 
     nse["stock"] = (
@@ -167,13 +218,14 @@ def download_nifty500():
         ],
     )
 
-    nse["sector"] = (
-        nse[sector_col]
-        .astype(str)
-        .str.strip()
-        if sector_col
-        else "UNKNOWN"
-    )
+    if sector_col:
+        nse["sector"] = (
+            nse[sector_col]
+            .astype(str)
+            .str.strip()
+        )
+    else:
+        nse["sector"] = "UNKNOWN"
 
     nse["join_key"] = nse["stock"].map(norm)
 
@@ -181,6 +233,7 @@ def download_nifty500():
         "join_key"
     )
 
+    # Download Dhan master.
     master_response = session.get(
         DHAN_MASTER_URL,
         timeout=90,
@@ -282,16 +335,10 @@ def download_nifty500():
     )
 
     dm = (
-        dm.dropna(
-            subset=["security_id"]
-        )
+        dm
+        .dropna(subset=["security_id"])
         .drop_duplicates("join_key")
-        [
-            [
-                "join_key",
-                "security_id",
-            ]
-        ]
+        [["join_key", "security_id"]]
     )
 
     result = nse[
@@ -321,11 +368,13 @@ def download_nifty500():
         ]
         .drop_duplicates("stock")
         .sort_values("stock")
+        .reset_index(drop=True)
     )
 
     if len(result) < 400:
         raise RuntimeError(
-            f"Only {len(result)} stocks mapped from Nifty 500 to Dhan"
+            f"Only {len(result)} stocks mapped "
+            "from Nifty 500 to Dhan"
         )
 
     return result
@@ -355,12 +404,16 @@ def load_stocks():
 
         st.error(
             "Nifty 500 loading failed; "
-            f"using only {len(fallback)} local stocks. "
-            f"Details: {exc}"
+            f"using only {len(fallback)} "
+            f"local stocks. Details: {exc}"
         )
 
         return fallback
 
+
+# ============================================================
+# MARKET STATUS
+# ============================================================
 
 def market_open(now):
     return (
@@ -371,20 +424,37 @@ def market_open(now):
     )
 
 
+# ============================================================
+# ONE LIVE BATCH REQUEST
+# ============================================================
+
 def dhan_snapshot(stocks):
+    security_ids = sorted(
+        {
+            int(value)
+            for value in stocks["security_id"]
+        }
+    )
+
+    if not security_ids:
+        return {}
+
+    payload = {
+        "NSE_EQ": security_ids
+    }
+
     response = requests.post(
         QUOTE_URL,
         headers=headers(),
-        json={
-            "NSE_EQ": sorted(
-                {
-                    int(x)
-                    for x in stocks.security_id
-                }
-            )
-        },
+        json=payload,
         timeout=60,
     )
+
+    if response.status_code == 429:
+        raise RuntimeError(
+            "Dhan live quote rate limit reached. "
+            "Wait before trying again."
+        )
 
     response.raise_for_status()
 
@@ -410,19 +480,27 @@ def flatten(snapshot):
                     str(security_id),
                 )
             ] = {
-                "ltp": quote.get("last_price"),
-                "open": ohlc.get("open"),
-                "high": ohlc.get("high"),
-                "low": ohlc.get("low"),
+                "ltp": quote.get(
+                    "last_price"
+                ),
+                "open": ohlc.get(
+                    "open"
+                ),
+                "high": ohlc.get(
+                    "high"
+                ),
+                "low": ohlc.get(
+                    "low"
+                ),
             }
 
     return output
 
 
-@st.cache_data(
-    ttl=86400,
-    show_spinner=False,
-)
+# ============================================================
+# ONE HISTORICAL REQUEST
+# ============================================================
+
 def historical_one(
     security_id,
     start,
@@ -448,6 +526,17 @@ def historical_one(
             timeout=30,
         )
 
+        if response.status_code == 429:
+            return {
+                "pdc": None,
+                "pdh": None,
+                "pdl": None,
+                "error": (
+                    "HTTP 429: Dhan rate limit reached"
+                ),
+                "rate_limited": True,
+            }
+
         if not response.ok:
             return {
                 "pdc": None,
@@ -457,6 +546,7 @@ def historical_one(
                     f"HTTP {response.status_code}: "
                     f"{response.text[:250]}"
                 ),
+                "rate_limited": False,
             }
 
         body = response.json()
@@ -474,12 +564,20 @@ def historical_one(
             "low",
         ]
 
-        if (
-            not isinstance(data, dict)
-            or any(
-                field not in data
-                for field in fields
-            )
+        if not isinstance(data, dict):
+            return {
+                "pdc": None,
+                "pdh": None,
+                "pdl": None,
+                "error": (
+                    "Invalid historical response"
+                ),
+                "rate_limited": False,
+            }
+
+        if any(
+            field not in data
+            for field in fields
         ):
             return {
                 "pdc": None,
@@ -488,6 +586,7 @@ def historical_one(
                 "error": (
                     "Missing historical candle fields"
                 ),
+                "rate_limited": False,
             }
 
         frame = pd.DataFrame(
@@ -504,9 +603,8 @@ def historical_one(
             )
 
         frame = (
-            frame.dropna(
-                subset=fields
-            )
+            frame
+            .dropna(subset=fields)
             .sort_values("timestamp")
         )
 
@@ -518,6 +616,7 @@ def historical_one(
                 "error": (
                     "No valid historical candles"
                 ),
+                "rate_limited": False,
             }
 
         row = frame.iloc[-1]
@@ -527,6 +626,7 @@ def historical_one(
             "pdh": float(row["high"]),
             "pdl": float(row["low"]),
             "error": None,
+            "rate_limited": False,
         }
 
     except Exception as exc:
@@ -535,57 +635,68 @@ def historical_one(
             "pdh": None,
             "pdl": None,
             "error": str(exc),
+            "rate_limited": False,
         }
 
 
+# ============================================================
+# HISTORICAL DATA
+#
+# This function is cached for 24 hours.
+# It will NOT execute again on every 15-second rerun.
+# ============================================================
+
 @st.cache_data(
-    ttl=86400,
+    ttl=HISTORY_CACHE_TTL,
     show_spinner=False,
 )
 def historical(
-    stocks,
+    stocks_key,
     start,
     end,
 ):
-    security_ids = [
-        int(sid)
-        for sid in stocks["security_id"]
-    ]
+    result = {}
 
-    results = {}
+    total = len(stocks_key)
 
-    # Parallel requests make the first load faster.
-    # Keep this moderate to avoid API rate limits.
-    with ThreadPoolExecutor(
-        max_workers=8
-    ) as executor:
+    progress = st.progress(
+        0,
+        text="Loading historical data...",
+    )
 
-        futures = {
-            executor.submit(
-                historical_one,
-                sid,
+    for position, security_id in enumerate(
+        stocks_key,
+        start=1,
+    ):
+        result[int(security_id)] = (
+            historical_one(
+                security_id,
                 start,
                 end,
-            ): sid
-            for sid in security_ids
-        }
+            )
+        )
 
-        for future in as_completed(futures):
-            sid = futures[future]
+        progress.progress(
+            position / total,
+            text=(
+                f"Historical data: "
+                f"{position}/{total}"
+            ),
+        )
 
-            try:
-                results[sid] = future.result()
+        # Prevent sending all historical calls instantly.
+        time.sleep(
+            HISTORY_REQUEST_DELAY
+        )
 
-            except Exception as exc:
-                results[sid] = {
-                    "pdc": None,
-                    "pdh": None,
-                    "pdl": None,
-                    "error": str(exc),
-                }
+    progress.empty()
 
-    return results
+    return result
 
+
+# ============================================================
+# BUILD DATAFRAME
+# ============================================================
 
 def build_frame(
     stocks,
@@ -597,19 +708,19 @@ def build_frame(
     for record in stocks.to_dict(
         "records"
     ):
-        sid = int(
+        security_id = int(
             record["security_id"]
         )
 
-        h = history.get(
-            sid,
+        historical_data = history.get(
+            security_id,
             {},
         )
 
-        q = live.get(
+        live_data = live.get(
             (
                 "NSE_EQ",
-                str(sid),
+                str(security_id),
             ),
             {},
         )
@@ -618,19 +729,39 @@ def build_frame(
             {
                 "Stock": record["stock"],
                 "Sector": record["sector"],
-                "LTP": q.get("ltp"),
-                "PDC": h.get("pdc"),
-                "PDH": h.get("pdh"),
-                "PDL": h.get("pdl"),
-                "Today's Open": q.get("open"),
-                "Today's Low": q.get("low"),
-                "Today's High": q.get("high"),
-                "History Error": h.get("error"),
+                "LTP": live_data.get(
+                    "ltp"
+                ),
+                "PDC": historical_data.get(
+                    "pdc"
+                ),
+                "PDH": historical_data.get(
+                    "pdh"
+                ),
+                "PDL": historical_data.get(
+                    "pdl"
+                ),
+                "Today's Open": live_data.get(
+                    "open"
+                ),
+                "Today's Low": live_data.get(
+                    "low"
+                ),
+                "Today's High": live_data.get(
+                    "high"
+                ),
+                "History Error": historical_data.get(
+                    "error"
+                ),
             }
         )
 
     return pd.DataFrame(rows)
 
+
+# ============================================================
+# CALCULATIONS
+# ============================================================
 
 def calculate(frame):
     df = frame.copy()
@@ -638,7 +769,7 @@ def calculate(frame):
     if df.empty:
         return df
 
-    numeric = [
+    numeric_columns = [
         "LTP",
         "PDC",
         "PDH",
@@ -648,9 +779,9 @@ def calculate(frame):
         "Today's High",
     ]
 
-    for col in numeric:
-        df[col] = pd.to_numeric(
-            df[col],
+    for column in numeric_columns:
+        df[column] = pd.to_numeric(
+            df[column],
             errors="coerce",
         )
 
@@ -697,6 +828,7 @@ def calculate(frame):
         * 100
     )
 
+    # BUY CONDITION
     buy = (
         df["PDC"].gt(0)
         & df["PDH"].notna()
@@ -713,23 +845,36 @@ def calculate(frame):
             )
             / df["PDC"]
             * 100
-        <= 1)
-        & df["LTP"].gt(df["PDH"])
-        & df["Sector LTP"].gt(
-            df["Sector PDC"]
         )
+        <= 1
     )
 
     buy &= (
-        df["Today's Low"].lt(
-            df["PDH"]
-        )
-        & df["Today's High"].gt(
-            df["PDH"]
-        )
-        & df["Sector AD"].gt(1)
+        df["LTP"]
+        .gt(df["PDH"])
     )
 
+    buy &= (
+        df["Sector LTP"]
+        .gt(df["Sector PDC"])
+    )
+
+    buy &= (
+        df["Today's Low"]
+        .lt(df["PDH"])
+    )
+
+    buy &= (
+        df["Today's High"]
+        .gt(df["PDH"])
+    )
+
+    buy &= (
+        df["Sector AD"]
+        .gt(1)
+    )
+
+    # SELL CONDITION
     sell = (
         df["PDC"].gt(0)
         & df["PDL"].notna()
@@ -746,21 +891,33 @@ def calculate(frame):
             )
             / df["PDC"]
             * 100
-        <= 1)
-        & df["LTP"].lt(df["PDL"])
-        & df["Sector LTP"].lt(
-            df["Sector PDC"]
         )
+        <= 1
     )
 
     sell &= (
-        df["Today's High"].gt(
-            df["PDL"]
-        )
-        & df["Today's Low"].lt(
-            df["PDL"]
-        )
-        & df["Sector AD"].lt(1)
+        df["LTP"]
+        .lt(df["PDL"])
+    )
+
+    sell &= (
+        df["Sector LTP"]
+        .lt(df["Sector PDC"])
+    )
+
+    sell &= (
+        df["Today's High"]
+        .gt(df["PDL"])
+    )
+
+    sell &= (
+        df["Today's Low"]
+        .lt(df["PDL"])
+    )
+
+    sell &= (
+        df["Sector AD"]
+        .lt(1)
     )
 
     df["Buy Alignment 🟢"] = (
@@ -773,6 +930,10 @@ def calculate(frame):
 
     return df
 
+
+# ============================================================
+# BUY / SELL TABLE
+# ============================================================
 
 def table(df, kind):
     level = (
@@ -794,7 +955,6 @@ def table(df, kind):
         "LTP",
         "PDC",
         level,
-        "Distance %",
         "Today's Open",
         "Today's Low",
         "Today's High",
@@ -802,6 +962,7 @@ def table(df, kind):
         "Sector PDC",
         "Sector % from PDC",
         "Sector AD",
+        "Distance %",
         alignment,
     ]
 
@@ -828,7 +989,6 @@ def table(df, kind):
             / selected["PDC"]
             * 100
         )
-
     else:
         distance = (
             (
@@ -839,16 +999,15 @@ def table(df, kind):
             * 100
         )
 
-    selected["Distance %"] = distance
-
     selected = (
         selected
-        .sort_values(
-            "Distance %"
+        .assign(
+            _distance=distance,
+            **{
+                "Distance %": distance
+            },
         )
-        .reset_index(
-            drop=True
-        )
+        .sort_values("_distance")
     )
 
     selected["Rank"] = range(
@@ -859,13 +1018,18 @@ def table(df, kind):
     return selected[columns]
 
 
+# ============================================================
+# APP UI
+# ============================================================
+
 st.title(
     "📈 Dhan Stock Scanner"
 )
 
 st.caption(
-    "Nifty 500 universe | Historical PDH/PDL/PDC once daily | "
-    "Live Dhan snapshot every 60 seconds"
+    "Nifty 500 universe | "
+    "Historical PDH/PDL/PDC cached once daily | "
+    "Live Dhan snapshot every 15 seconds"
 )
 
 now = datetime.now(IST)
@@ -873,10 +1037,15 @@ now = datetime.now(IST)
 opened = market_open(now)
 
 st.info(
-    f"India time: {now:%Y-%m-%d %H:%M:%S IST} | "
+    f"India time: "
+    f"{now:%Y-%m-%d %H:%M:%S IST} | "
     f"{'Market open' if opened else 'Market closed; historical values remain available.'}"
 )
 
+
+# ============================================================
+# MAIN APP
+# ============================================================
 
 try:
     stocks = load_stocks()
@@ -888,21 +1057,37 @@ try:
 
     end = now.date().isoformat()
 
+    # Stable tuple used by Streamlit cache.
+    # Historical function will run once per cache period.
+    stocks_key = tuple(
+        sorted(
+            int(value)
+            for value in stocks[
+                "security_id"
+            ].tolist()
+        )
+    )
+
+    # This is cached for 24 hours.
+    # It will NOT run every 15 seconds.
     history = historical(
-        stocks,
+        stocks_key,
         start,
         end,
     )
 
-    live = (
-        flatten(
-            dhan_snapshot(
-                stocks
-            )
+    # This is the only Dhan request repeated
+    # every 15 seconds.
+    if opened:
+        live_snapshot = dhan_snapshot(
+            stocks
         )
-        if opened
-        else {}
-    )
+
+        live = flatten(
+            live_snapshot
+        )
+    else:
+        live = {}
 
     data = calculate(
         build_frame(
@@ -959,8 +1144,10 @@ try:
 
     if not opened:
         st.warning(
-            "Live LTP/today OHLC are blank while NSE is closed. "
-            "PDC/PDH/PDL are historical Dhan values."
+            "Live LTP/today OHLC are blank "
+            "while NSE is closed. "
+            "PDC/PDH/PDL are historical "
+            "Dhan values."
         )
 
     st.subheader(
@@ -993,7 +1180,8 @@ try:
         )
 
     st.caption(
-        f"Last check: {now:%Y-%m-%d %H:%M:%S IST} | "
+        f"Last check: "
+        f"{now:%Y-%m-%d %H:%M:%S IST} | "
         f"Refresh: {REFRESH_SECONDS}s"
     )
 
@@ -1002,6 +1190,10 @@ except Exception as exc:
         f"Scanner error: {exc}"
     )
 
+
+# ============================================================
+# REFRESH ONLY LIVE DATA
+# ============================================================
 
 time.sleep(
     REFRESH_SECONDS
