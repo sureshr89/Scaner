@@ -1,6 +1,7 @@
 import os
 import time
-from datetime import datetime
+from datetime import datetime, time as dt_time
+from zoneinfo import ZoneInfo
 
 import pandas as pd
 import requests
@@ -10,10 +11,26 @@ st.set_page_config(page_title="Dhan Stock Scanner", page_icon="📈", layout="wi
 
 REFRESH_SECONDS = 15
 QUOTE_URL = "https://api.dhan.co/v2/marketfeed/ohlc"
+IST = ZoneInfo("Asia/Kolkata")
 
 
 def get_secret(name: str) -> str:
     return os.getenv(name) or st.secrets.get(name, "")
+
+
+def india_now() -> datetime:
+    return datetime.now(IST)
+
+
+def market_status(now: datetime) -> tuple[bool, str]:
+    # NSE regular session: Monday-Friday, 09:15-15:30 IST.
+    if now.weekday() >= 5:
+        return False, "Market is closed today because it is Saturday/Sunday."
+    if now.time() < dt_time(9, 15):
+        return False, "Market has not opened yet. NSE regular trading starts at 09:15 IST."
+    if now.time() > dt_time(15, 30):
+        return False, "NSE regular trading has ended for today at 15:30 IST."
+    return True, "NSE regular market hours are active."
 
 
 def load_stocks() -> pd.DataFrame:
@@ -96,7 +113,6 @@ def build_frame(stocks: pd.DataFrame, prices: dict) -> pd.DataFrame:
 def calculate(df: pd.DataFrame) -> pd.DataFrame:
     if df.empty:
         return df
-    # Reference values are not yet available automatically, so keep these blank.
     for col in ["pdh", "pdl", "sector_ltp", "sector_pdc", "sector_ad"]:
         df[col] = float("nan")
     df["Buy Alignment"] = False
@@ -117,24 +133,38 @@ def empty_table(kind: str) -> pd.DataFrame:
 st.title("📈 Dhan Buy / Sell Scanner")
 st.caption("One Dhan snapshot every 15 seconds → one dataframe → all calculations/rankings from that same snapshot")
 
+now_ist = india_now()
+open_now, status_text = market_status(now_ist)
+st.info(f"India time: {now_ist:%Y-%m-%d %H:%M:%S IST} | {status_text}")
+
 try:
     stocks = load_stocks()
-    snapshot = dhan_snapshot(stocks)
-    prices = flatten(snapshot)
-    data = calculate(build_frame(stocks, prices))
 
-    m1, m2, m3 = st.columns(3)
-    m1.metric("Stocks received", len(data))
-    m2.metric("🟢 Buy", 0)
-    m3.metric("🔴 Sell", 0)
-
-    if data.empty:
-        st.warning("Dhan returned no matching NSE_EQ instruments for this request.")
-        st.info(f"Requested security IDs: {', '.join(str(int(x)) for x in stocks['security_id'])}")
-        st.info(f"Dhan response data segments: {list((snapshot.get('data') or {}).keys())}")
-        st.info("If the market is closed, wait until market hours. If this remains empty during market hours, the Dhan security IDs or API permissions need correction.")
+    if not open_now:
+        m1, m2, m3 = st.columns(3)
+        m1.metric("Stocks received", 0)
+        m2.metric("🟢 Buy", 0)
+        m3.metric("🔴 Sell", 0)
+        st.warning("No live quotes are requested while the NSE regular market is closed. The scanner will try again automatically.")
+        snapshot = {"data": {}}
+        data = pd.DataFrame()
     else:
-        st.success(f"Received {len(data)} stock quotes from Dhan.")
+        snapshot = dhan_snapshot(stocks)
+        prices = flatten(snapshot)
+        data = calculate(build_frame(stocks, prices))
+
+        m1, m2, m3 = st.columns(3)
+        m1.metric("Stocks received", len(data))
+        m2.metric("🟢 Buy", 0)
+        m3.metric("🔴 Sell", 0)
+
+        if data.empty:
+            st.warning("Dhan returned no matching NSE_EQ instruments for this request.")
+            st.info(f"Requested security IDs: {', '.join(str(int(x)) for x in stocks['security_id'])}")
+            st.info(f"Dhan response data segments: {list((snapshot.get('data') or {}).keys())}")
+            st.info("If this remains empty during market hours, the Dhan security IDs or API permissions need correction.")
+        else:
+            st.success(f"Received {len(data)} stock quotes from Dhan.")
 
     st.subheader("🟢 BUY WATCHLIST")
     st.dataframe(empty_table("buy"), use_container_width=True)
@@ -145,7 +175,7 @@ try:
     with st.expander("All scanned stocks"):
         st.dataframe(data, use_container_width=True)
 
-    st.caption(f"Last Dhan fetch: {datetime.now():%Y-%m-%d %H:%M:%S} | Refresh: {REFRESH_SECONDS}s")
+    st.caption(f"Last check: {now_ist:%Y-%m-%d %H:%M:%S IST} | Refresh: {REFRESH_SECONDS}s")
 
 except Exception as exc:
     st.error(f"Scanner error: {exc}")
