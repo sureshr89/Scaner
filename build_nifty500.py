@@ -1,11 +1,10 @@
-"""Build stocks.csv from NSE Nifty 500 data and the Dhan instrument master.
+"""Build stocks.csv from Nifty Midcap 150 data and the Dhan instrument master.
 
 Run locally:
     python build_nifty500.py
 
-No Dhan credentials are required for this step. The script intentionally keeps
-unmapped rows so missing Dhan security IDs are visible instead of silently
-removing constituents.
+The filename is kept for backward compatibility; the generated universe is
+Nifty Midcap 150, not Nifty 500.
 """
 from io import StringIO
 from pathlib import Path
@@ -13,7 +12,7 @@ import re
 import requests
 import pandas as pd
 
-NSE_URL = "https://www.nseindia.com/api/equity-stockIndices?index=NIFTY%20500"
+NSE_URL = "https://www.nseindia.com/api/equity-stockIndices?index=NIFTY%20MIDCAP%20150"
 DHAN_MASTER_URL = "https://images.dhan.co/api-data/api-scrip-master.csv"
 OUT = Path("stocks.csv")
 
@@ -48,7 +47,7 @@ def main():
     payload = get(NSE_URL).json()
     records = payload.get("data", [])
     if not records:
-        raise RuntimeError("NSE returned no Nifty 500 constituent records")
+        raise RuntimeError("NSE returned no Nifty Midcap 150 constituent records")
     nse = pd.DataFrame(records)
 
     symbol_col = first_column(nse, ["symbol"])
@@ -88,7 +87,7 @@ def main():
         columns.append("isin")
     out[columns].sort_values("stock").to_csv(OUT, index=False)
 
-    print(f"Wrote {len(out)} Nifty 500 rows to {OUT}")
+    print(f"Wrote {len(out)} Nifty Midcap 150 rows to {OUT}")
     print(f"Mapped to Dhan: {(out['mapping_status'] == 'OK').sum()}")
     print(f"Missing Dhan IDs: {(out['mapping_status'] != 'OK').sum()}")
 
