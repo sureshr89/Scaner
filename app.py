@@ -140,6 +140,20 @@ def previous_ohlc(security_id, start, end):
     return {"PDC": float(candle["close"]), "PDH": float(candle["high"]), "PDL": float(candle["low"]), "History Error": None}
 
 
+@st.cache_data(ttl=86400, show_spinner=False)
+def load_history(security_ids, start, end):
+    history = {}
+    progress = st.progress(0, text="Loading historical data once for today...")
+    for index, security_id in enumerate(security_ids, 1):
+        try:
+            history[int(security_id)] = previous_ohlc(security_id, start, end)
+        except Exception as error:
+            history[int(security_id)] = {"PDC": None, "PDH": None, "PDL": None, "History Error": str(error)}
+        progress.progress(index / len(security_ids), text=f"Historical data: {index}/{len(security_ids)}")
+    progress.empty()
+    return history
+
+
 def bias(value):
     if pd.isna(value): return "N/A"
     if value > 1: return "🟢 Bullish"
@@ -164,20 +178,12 @@ def calculate(df):
     return df
 
 
-st.title("📈 Nifty Midcap 150 Stock Scanner")
-st.caption("Current Nifty Midcap 150 universe | Dhan live LTP | Previous completed daily PDC/PDH/PDL | Sector A/D and bias")
-now = datetime.now(IST)
-try:
+def render_scanner():
+    now = datetime.now(IST)
     stocks = load_universe()
     end = now.date()
     start = end - timedelta(days=30)
-    history = {}
-    progress = st.progress(0, text="Loading previous-day OHLC...")
-    for index, security_id in enumerate(stocks["security_id"], 1):
-        try: history[int(security_id)] = previous_ohlc(security_id, start.isoformat(), end.isoformat())
-        except Exception as error: history[int(security_id)] = {"PDC": None, "PDH": None, "PDL": None, "History Error": str(error)}
-        progress.progress(index / 150, text=f"Historical data: {index}/150")
-    progress.empty()
+    history = load_history(tuple(stocks["security_id"].astype(int)), start.isoformat(), end.isoformat())
     live = live_quotes(stocks)
     rows = []
     for record in stocks.to_dict("records"):
@@ -189,5 +195,16 @@ try:
     display = data[columns].sort_values(["Sector", "Stock"])
     st.metric("Stocks scanned", len(display))
     st.dataframe(display, use_container_width=True, hide_index=True, column_config={"Sector A/D Ratio": st.column_config.NumberColumn(format="%.2f"), "LTP": st.column_config.NumberColumn(format="%.2f"), "PDC": st.column_config.NumberColumn(format="%.2f"), "PDH": st.column_config.NumberColumn(format="%.2f"), "PDL": st.column_config.NumberColumn(format="%.2f"), "PDC to PDH %": st.column_config.NumberColumn(format="%.2f%%"), "PDC to PDL %": st.column_config.NumberColumn(format="%.2f%%")})
+    st.caption(f"Historical data cached for {end.isoformat()}; live quotes refresh every 15 seconds.")
+
+
+st.title("📈 Nifty Midcap 150 Stock Scanner")
+st.caption("Historical OHLC loads once per day; Dhan live LTP refreshes every 15 seconds.")
+try:
+    if hasattr(st, "fragment"):
+        st.fragment(run_every="15s")(render_scanner)()
+    else:
+        render_scanner()
+        st.info("Upgrade Streamlit to use automatic 15-second refresh. Historical data is cached for 24 hours.")
 except Exception as error:
     st.error(f"Scanner error: {error}")
