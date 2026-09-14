@@ -534,6 +534,9 @@ def historical_one(
                 "pdc": None,
                 "pdh": None,
                 "pdl": None,
+                "close_1w": None,
+                "close_1m": None,
+                "close_3m": None,
                 "error": (
                     "HTTP 429: Dhan rate limit reached"
                 ),
@@ -545,6 +548,9 @@ def historical_one(
                 "pdc": None,
                 "pdh": None,
                 "pdl": None,
+                "close_1w": None,
+                "close_1m": None,
+                "close_3m": None,
                 "error": (
                     f"HTTP {response.status_code}: "
                     f"{response.text[:250]}"
@@ -572,6 +578,9 @@ def historical_one(
                 "pdc": None,
                 "pdh": None,
                 "pdl": None,
+                "close_1w": None,
+                "close_1m": None,
+                "close_3m": None,
                 "error": (
                     "Invalid historical response"
                 ),
@@ -586,6 +595,9 @@ def historical_one(
                 "pdc": None,
                 "pdh": None,
                 "pdl": None,
+                "close_1w": None,
+                "close_1m": None,
+                "close_3m": None,
                 "error": (
                     "Missing historical candle fields"
                 ),
@@ -609,6 +621,7 @@ def historical_one(
             frame
             .dropna(subset=fields)
             .sort_values("timestamp")
+            .reset_index(drop=True)
         )
 
         if frame.empty:
@@ -616,18 +629,54 @@ def historical_one(
                 "pdc": None,
                 "pdh": None,
                 "pdl": None,
+                "close_1w": None,
+                "close_1m": None,
+                "close_3m": None,
                 "error": (
                     "No valid historical candles"
                 ),
                 "rate_limited": False,
             }
 
-        row = frame.iloc[-1]
+        latest_index = len(frame) - 1
+
+        pdc_row = frame.iloc[latest_index]
+
+        # Historical closes:
+        # 1W = 5 trading sessions before PDC
+        # 1M = 21 trading sessions before PDC
+        # 3M = 63 trading sessions before PDC
+        close_1w = (
+            float(
+                frame.iloc[latest_index - 5]["close"]
+            )
+            if latest_index >= 5
+            else None
+        )
+
+        close_1m = (
+            float(
+                frame.iloc[latest_index - 21]["close"]
+            )
+            if latest_index >= 21
+            else None
+        )
+
+        close_3m = (
+            float(
+                frame.iloc[latest_index - 63]["close"]
+            )
+            if latest_index >= 63
+            else None
+        )
 
         return {
-            "pdc": float(row["close"]),
-            "pdh": float(row["high"]),
-            "pdl": float(row["low"]),
+            "pdc": float(pdc_row["close"]),
+            "pdh": float(pdc_row["high"]),
+            "pdl": float(pdc_row["low"]),
+            "close_1w": close_1w,
+            "close_1m": close_1m,
+            "close_3m": close_3m,
             "error": None,
             "rate_limited": False,
         }
@@ -637,6 +686,9 @@ def historical_one(
             "pdc": None,
             "pdh": None,
             "pdl": None,
+            "close_1w": None,
+            "close_1m": None,
+            "close_3m": None,
             "error": str(exc),
             "rate_limited": False,
         }
@@ -657,21 +709,43 @@ def historical(stocks_key, start, end, refresh_key):
     """Load historical values sequentially to avoid Dhan HTTP 429 errors."""
     result = {}
     total = len(stocks_key)
-    progress = st.progress(0, text="Loading historical data slowly to respect Dhan limits...")
 
-    for completed, security_id in enumerate(stocks_key, start=1):
-        values = historical_one(security_id, start, end)
+    progress = st.progress(
+        0,
+        text=(
+            "Loading historical data slowly "
+            "to respect Dhan limits..."
+        ),
+    )
+
+    for completed, security_id in enumerate(
+        stocks_key,
+        start=1,
+    ):
+        values = historical_one(
+            security_id,
+            start,
+            end,
+        )
+
         result[int(security_id)] = values
 
         progress.progress(
             completed / total if total else 1.0,
-            text=f"Historical data: {completed}/{total}",
+            text=(
+                f"Historical data: "
+                f"{completed}/{total}"
+            ),
         )
 
-        # Never burst requests. This is intentionally slow and safe.
-        time.sleep(HISTORY_REQUEST_DELAY)
+        # Never burst requests.
+        # This is intentionally slow and safe.
+        time.sleep(
+            HISTORY_REQUEST_DELAY
+        )
 
     progress.empty()
+
     return result
 
 
@@ -722,6 +796,15 @@ def build_frame(
                 "PDL": historical_data.get(
                     "pdl"
                 ),
+                "1W Close": historical_data.get(
+                    "close_1w"
+                ),
+                "1M Close": historical_data.get(
+                    "close_1m"
+                ),
+                "3M Close": historical_data.get(
+                    "close_3m"
+                ),
                 "Today's Open": live_data.get(
                     "open"
                 ),
@@ -755,6 +838,9 @@ def calculate(frame):
         "PDC",
         "PDH",
         "PDL",
+        "1W Close",
+        "1M Close",
+        "3M Close",
         "Today's Open",
         "Today's Low",
         "Today's High",
@@ -808,6 +894,40 @@ def calculate(frame):
         / df["Sector PDC"]
         * 100
     )
+
+    # Historical close percentages calculated with respect to PDC.
+    #
+    # Formula:
+    # (Historical Close - PDC) / PDC * 100
+
+    valid_pdc = df["PDC"].gt(0)
+
+    df["1W Close % from PDC"] = (
+        (
+            df["1W Close"]
+            - df["PDC"]
+        )
+        / df["PDC"]
+        * 100
+    ).where(valid_pdc)
+
+    df["1M Close % from PDC"] = (
+        (
+            df["1M Close"]
+            - df["PDC"]
+        )
+        / df["PDC"]
+        * 100
+    ).where(valid_pdc)
+
+    df["3M Close % from PDC"] = (
+        (
+            df["3M Close"]
+            - df["PDC"]
+        )
+        / df["PDC"]
+        * 100
+    ).where(valid_pdc)
 
     # BUY CONDITION
     buy = (
@@ -1041,12 +1161,15 @@ try:
     # Use the most recent completed weekday.
     # This prevents today's incomplete candle being used as PDC/PDH/PDL.
     end_date = now.date() - timedelta(days=1)
+
     while end_date.weekday() >= 5:
         end_date -= timedelta(days=1)
 
+    # Approximately 3 months of trading history.
+    # Extra calendar days allow for weekends and market holidays.
     start = (
         end_date
-        - timedelta(days=30)
+        - timedelta(days=100)
     ).isoformat()
 
     end = end_date.isoformat()
@@ -1197,6 +1320,7 @@ try:
         interval=REFRESH_SECONDS * 1000,
         key="dhan_live_refresh",
     )
+
 except ImportError:
     time.sleep(REFRESH_SECONDS)
     st.rerun()
