@@ -189,9 +189,14 @@ def render_scanner():
     rows = []
     for record in stocks.to_dict("records"):
         sid = int(record["security_id"])
-        rows.append({"Stock": record["stock"], "Sector": record["sector"], **live.get(("NSE_EQ", str(sid)), {}), **history.get(sid, {})})
+        quote = live.get(("NSE_EQ", str(sid)), {})
+        old = history.get(sid, {})
+        rows.append({"Stock": record["stock"], "Sector": record["sector"], "LTP": quote.get("LTP"), "Today's Open": quote.get("Today's Open"), "Today's Low": quote.get("Today's Low"), "Today's High": quote.get("Today's High"), "PDC": old.get("PDC"), "PDH": old.get("PDH"), "PDL": old.get("PDL")})
     data = calculate(pd.DataFrame(rows))
     columns = ["Stock", "Sector", "Sector A/D Ratio", "Sector Bias", "LTP", "Today's Open", "Today's Low", "Today's High", "PDC", "PDH", "PDL", "PDC to PDH %", "PDC to PDL %"]
+    for column in columns:
+        if column not in data.columns:
+            data[column] = pd.NA
     display = data[columns].sort_values(["Sector", "Stock"])
     st.metric("Stocks scanned", len(display))
     st.dataframe(display, use_container_width=True, hide_index=True)
