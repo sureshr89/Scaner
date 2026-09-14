@@ -10,7 +10,7 @@ import streamlit as st
 
 
 st.set_page_config(
-    page_title="Nifty Midcap 150 Scanner",
+    page_title="Nifty 500 Scanner",
     page_icon="📈",
     layout="wide",
 )
@@ -18,14 +18,16 @@ st.set_page_config(
 
 IST = ZoneInfo("Asia/Kolkata")
 
+INDEX_NAME = "NIFTY 500"
+
 NSE_URL = (
     "https://www.nseindia.com/api/equity-stockIndices"
-    "?index=NIFTY%20MIDCAP%20150"
+    "?index=NIFTY%20500"
 )
 
 CSV_URL = (
     "https://www.niftyindices.com/IndexConstituent/"
-    "ind_niftymidcap150list.csv"
+    "ind_nifty500list.csv"
 )
 
 MASTER_URL = "https://images.dhan.co/api-data/api-scrip-master.csv"
@@ -176,7 +178,7 @@ def load_universe():
 
     if frame is None or frame.empty:
         raise RuntimeError(
-            "Unable to load Nifty Midcap 150 universe: "
+            f"Unable to load {INDEX_NAME} universe: "
             + "; ".join(errors)
         )
 
@@ -402,10 +404,10 @@ def load_universe():
         .reset_index(drop=True)
     )
 
-    if len(result) < 120:
+    if len(result) < 400:
         raise RuntimeError(
             f"Only {len(result)} stocks mapped; "
-            "expected at least 120"
+            "expected at least 400 for Nifty 500"
         )
 
     return result
@@ -630,11 +632,6 @@ def calculate(data, live_is_fresh):
         data["Sector"]
     ).transform("sum")
 
-    # Correct A/D ratio:
-    # 5 up / 0 down = 5
-    # 0 up / 5 down = 0
-    # 5 up / 5 down = 1
-    # 0 up / 0 down = N/A
     ratio = up.div(
         down.where(
             down.ne(0),
@@ -929,18 +926,18 @@ def render():
     )
 
     st.caption(
-        "LTP refreshes every 15 seconds during "
-        "market hours. Signals require fresh quotes "
-        "and at least 5 valid stocks in the sector."
+        "Nifty 500 LTP refreshes every 15 seconds "
+        "during market hours. Signals require fresh "
+        "quotes and at least 5 valid stocks in the sector."
     )
 
 
 st.title(
-    "📈 Nifty Midcap 150 Stock Scanner"
+    "📈 Nifty 500 Stock Scanner"
 )
 
 st.caption(
-    "Nifty Midcap 150 • Dhan live quotes • "
+    "Nifty 500 • Dhan live quotes • "
     "previous-day OHLC • sector breadth"
 )
 
