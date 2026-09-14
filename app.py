@@ -32,10 +32,10 @@ REFRESH_SECONDS = 15
 HISTORY_CACHE_TTL = 86400
 
 # Delay between historical requests during the first load.
-HISTORY_REQUEST_DELAY = 0.0
+HISTORY_REQUEST_DELAY = 1.0
 
 # Small parallel batch size: faster startup without flooding Dhan.
-HISTORY_WORKERS = 5
+HISTORY_WORKERS = 1
 
 QUOTE_URL = "https://api.dhan.co/v2/marketfeed/ohlc"
 HISTORY_URL = "https://api.dhan.co/v2/charts/historical"
@@ -654,31 +654,22 @@ def historical_one(
     show_spinner=False,
 )
 def historical(stocks_key, start, end, refresh_key):
-    """Load historical values once per refresh_key, in parallel."""
-    from concurrent.futures import ThreadPoolExecutor, as_completed
-
+    """Load historical values sequentially to avoid Dhan HTTP 429 errors."""
     result = {}
     total = len(stocks_key)
-    progress = st.progress(0, text="Loading historical data...")
+    progress = st.progress(0, text="Loading historical data slowly to respect Dhan limits...")
 
-    def fetch_one(security_id):
-        return int(security_id), historical_one(security_id, start, end)
+    for completed, security_id in enumerate(stocks_key, start=1):
+        values = historical_one(security_id, start, end)
+        result[int(security_id)] = values
 
-    completed = 0
-    with ThreadPoolExecutor(max_workers=HISTORY_WORKERS) as executor:
-        futures = {
-            executor.submit(fetch_one, security_id): security_id
-            for security_id in stocks_key
-        }
+        progress.progress(
+            completed / total if total else 1.0,
+            text=f"Historical data: {completed}/{total}",
+        )
 
-        for future in as_completed(futures):
-            security_id, values = future.result()
-            result[security_id] = values
-            completed += 1
-            progress.progress(
-                completed / total if total else 1.0,
-                text=f"Historical data: {completed}/{total}",
-            )
+        # Never burst requests. This is intentionally slow and safe.
+        time.sleep(HISTORY_REQUEST_DELAY)
 
     progress.empty()
     return result
