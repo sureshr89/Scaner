@@ -159,17 +159,37 @@ def load_history(ids, start, end):
 
 
 def calculate(data):
-    for field in ["LTP", "PDC", "PDH", "PDL"]:
+    for field in ["LTP", "PDC", "PDH", "PDL", "Today's Low", "Today's High"]:
         data[field] = pd.to_numeric(data.get(field, pd.Series(index=data.index)), errors="coerce")
-    valid = data.LTP.notna() & data.PDC.notna()
-    up = (valid & data.LTP.gt(data.PDC)).groupby(data.Sector).transform("sum")
-    down = (valid & data.LTP.lt(data.PDC)).groupby(data.Sector).transform("sum")
+    valid = data["LTP"].notna() & data["PDC"].notna()
+    up = (valid & data["LTP"].gt(data["PDC"])).groupby(data["Sector"]).transform("sum")
+    down = (valid & data["LTP"].lt(data["PDC"])).groupby(data["Sector"]).transform("sum")
     ratio = up.div(down.replace(0, pd.NA)).mask((up > 0) & (down == 0), float("inf")).mask((up == 0) & (down > 0), 0).mask((up == 0) & (down == 0), pd.NA)
     data["Sector A/D Ratio"] = ratio
     data["Sector Bias"] = ratio.map(lambda x: "🟢 Bullish" if pd.notna(x) and x > 1 else "🔴 Bearish" if pd.notna(x) and x < 1 else "⚪ Neutral" if pd.notna(x) else "N/A")
-    good = data.PDC.gt(0)
-    data["PDC to PDH %"] = ((data.PDH - data.PDC) / data.PDC * 100).where(good)
-    data["PDC to PDL %"] = ((data.PDC - data.PDL) / data.PDC * 100).where(good)
+    good = data["PDC"].gt(0)
+    data["PDC to PDH %"] = ((data["PDH"] - data["PDC"]) / data["PDC"] * 100).where(good)
+    data["PDC to PDL %"] = ((data["PDC"] - data["PDL"]) / data["PDC"] * 100).where(good)
+
+    # Green: price crossed yesterday's high with a bullish sector and a tight PDC-PDH range.
+    data["Green Signal"] = (
+        data["Today's High"].gt(data["PDH"])
+        & data["Today's Low"].lt(data["PDH"])
+        & data["LTP"].gt(data["PDH"])
+        & data["Sector A/D Ratio"].gt(1)
+        & data["PDC to PDH %"].le(0.15)
+    )
+    # Red: price crossed yesterday's low with a bearish sector and a tight PDC-PDL range.
+    data["Red Signal"] = (
+        data["Today's Low"].lt(data["PDL"])
+        & data["Today's High"].gt(data["PDL"])
+        & data["LTP"].lt(data["PDL"])
+        & data["Sector A/D Ratio"].lt(1)
+        & data["PDC to PDL %"].le(0.15)
+    )
+    data["Signal"] = ""
+    data.loc[data["Green Signal"], "Signal"] = "🟢 BUY"
+    data.loc[data["Red Signal"], "Signal"] = "🔴 SELL"
     return data
 
 
@@ -207,10 +227,14 @@ def render():
         quote, old = live.get(("NSE_EQ", str(sid)), {}), history.get(sid, {})
         rows.append({"Stock": record["stock"], "Sector": record["sector"], **{k: quote.get(k) for k in ["LTP", "Today's Open", "Today's Low", "Today's High"]}, **{k: old.get(k) for k in ["PDC", "PDH", "PDL"]}})
     data = calculate(pd.DataFrame(rows))
-    columns = ["Stock", "Sector", "Sector A/D Ratio", "Sector Bias", "LTP", "Today's Open", "Today's Low", "Today's High", "PDC", "PDH", "PDL", "PDC to PDH %", "PDC to PDL %"]
+    columns = ["Signal", "Stock", "Sector", "Sector A/D Ratio", "Sector Bias", "LTP", "Today's Open", "Today's Low", "Today's High", "PDC", "PDH", "PDL", "PDC to PDH %", "PDC to PDL %"]
     st.metric("Stocks scanned", len(data))
-    st.dataframe(data.reindex(columns=columns).sort_values(["Sector", "Stock"]), use_container_width=True, hide_index=True)
-    st.caption("Previous completed trading-day OHLC; historical cache: 24 hours; live quote cache: 30 seconds.")
+    st.dataframe(
+        data.reindex(columns=columns).sort_values(["Signal", "Sector", "Stock"], ascending=[False, True, True]),
+        use_container_width=True,
+        hide_index=True,
+    )
+    st.caption("🟢 BUY = today's high > PDH, today's low < PDH, LTP > PDH, sector A/D > 1, and PDC-to-PDH ≤ 0.15%. 🔴 SELL is the symmetrical PDL rule.")
 
 
 st.title("📈 Nifty Midcap 150 Stock Scanner")
