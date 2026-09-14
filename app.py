@@ -29,7 +29,12 @@ def headers():
     cid, token = secret("DHAN_CLIENT_ID"), secret("DHAN_ACCESS_TOKEN")
     if not cid or not token:
         raise RuntimeError("Configure DHAN_CLIENT_ID and DHAN_ACCESS_TOKEN in Streamlit Secrets.")
-    return {"Accept": "application/json", "Content-Type": "application/json", "access-token": token, "client-id": cid}
+    return {
+        "Accept": "application/json",
+        "Content-Type": "application/json",
+        "access-token": token,
+        "client-id": cid,
+    }
 
 
 def norm(value):
@@ -43,7 +48,13 @@ def col(frame, names):
 
 def session():
     s = requests.Session()
-    s.headers.update({"User-Agent": "Mozilla/5.0", "Accept": "application/json,text/csv,*/*", "Referer": "https://www.nseindia.com/"})
+    s.headers.update(
+        {
+            "User-Agent": "Mozilla/5.0",
+            "Accept": "application/json,text/csv,*/*",
+            "Referer": "https://www.nseindia.com/",
+        }
+    )
     return s
 
 
@@ -57,6 +68,7 @@ def load_universe():
         frame = pd.DataFrame(r.json().get("data", []))
     except Exception as e:
         errors.append(f"NSE: {e}")
+
     if frame is None or frame.empty:
         try:
             r = s.get(CSV_URL, timeout=30)
@@ -64,6 +76,7 @@ def load_universe():
             frame = pd.read_csv(StringIO(r.text))
         except Exception as e:
             errors.append(f"CSV: {e}")
+
     if frame is None or frame.empty:
         raise RuntimeError("Unable to load Nifty Midcap 150: " + "; ".join(errors))
 
@@ -71,17 +84,30 @@ def load_universe():
     sector = col(frame, ["industry", "sector", "industry_info"])
     if not symbol:
         raise RuntimeError(f"Universe has no symbol column: {list(frame.columns)}")
+
     frame["stock"] = frame[symbol].astype(str).str.upper().str.strip()
     frame = frame[~frame.stock.str.contains("NIFTY", na=False)].copy()
     frame["sector"] = frame[sector].astype(str).str.strip() if sector else "UNKNOWN"
     frame["key"] = frame.stock.map(norm)
     frame = frame.drop_duplicates("key")
 
-    master = pd.read_csv(StringIO(s.get(MASTER_URL, timeout=90).text), low_memory=False)
-    segment = col(master, ["exchange_segment", "exchange_segment_name", "exchange_segment_code", "sem_exm_exch_id"])
+    master_response = s.get(MASTER_URL, timeout=90)
+    master_response.raise_for_status()
+    master = pd.read_csv(StringIO(master_response.text), low_memory=False)
+
+    segment = col(
+        master,
+        [
+            "exchange_segment",
+            "exchange_segment_name",
+            "exchange_segment_code",
+            "sem_exm_exch_id",
+        ],
+    )
     market_segment = col(master, ["sem_segment", "segment"])
     msymbol = col(master, ["symbol", "trading_symbol", "sem_trading_symbol"])
     sid = col(master, ["security_id", "sem_security_id", "sem_smst_security_id"])
+
     if not all([segment, msymbol, sid]):
         raise RuntimeError(f"Dhan master columns not recognised: {list(master.columns)[:30]}")
 
@@ -90,64 +116,136 @@ def load_universe():
     if segment.lower() == "sem_exm_exch_id":
         dm = dm[ex.eq("NSE")]
         if market_segment:
-            dm = dm[dm[market_segment].astype(str).str.upper().isin(["E", "EQUITY", "NSE_EQ"])]
+            dm = dm[
+                dm[market_segment]
+                .astype(str)
+                .str.upper()
+                .isin(["E", "EQUITY", "NSE_EQ"])
+            ]
     else:
         dm = dm[ex.eq("NSE_EQ")]
+
     dm["key"] = dm[msymbol].map(norm)
     dm["security_id"] = pd.to_numeric(dm[sid], errors="coerce")
-    dm = dm.dropna(subset=["security_id"]).drop_duplicates("key")[["key", "security_id"]]
+    dm = dm.dropna(subset=["security_id"]).drop_duplicates("key")[
+        ["key", "security_id"]
+    ]
 
     result = frame[["stock", "sector", "key"]].merge(dm, on="key", how="inner")
     result["security_id"] = result.security_id.astype(int)
-    result = result[["stock", "sector", "security_id"]].drop_duplicates("stock").sort_values("stock").reset_index(drop=True)
+    result = (
+        result[["stock", "sector", "security_id"]]
+        .drop_duplicates("stock")
+        .sort_values("stock")
+        .reset_index(drop=True)
+    )
+
     if len(result) != 150:
         missing = sorted(set(frame.stock) - set(result.stock))
-        raise RuntimeError(f"Expected exactly 150 mapped stocks; got {len(result)}. Unmapped: {missing[:20]}")
+        raise RuntimeError(
+            f"Expected exactly 150 mapped stocks; got {len(result)}. "
+            f"Unmapped: {missing[:20]}"
+        )
+
     return result
 
 
 def live_quotes(stocks):
-    ids = sorted(stocks.security_id.astype(int).unique())
-    r = requests.post(QUOTE_URL, headers=headers(), json={"NSE_EQ": ids}, timeout=60)
-    r.raise_for_status()
+    ids = sorted(stocks["security_id"].astype(int).unique())
+    response = requests.post(
+        QUOTE_URL,
+        headers=headers(),
+        json={"NSE_EQ": ids},
+        timeout=60,
+    )
+    response.raise_for_status()
+
     out = {}
-    for seg, items in (r.json().get("data") or {}).items():
-        for sid, q in (items or {}).items():
-            o = q.get("ohlc") or {}
-            out[(seg, str(sid))] = {"LTP": q.get("last_price"), "Today's Open": o.get("open"), "Today's Low": o.get("low"), "Today's High": o.get("high")}
+    for segment, items in (response.json().get("data") or {}).items():
+        for security_id, quote in (items or {}).items():
+            ohlc = quote.get("ohlc") or {}
+            out[(segment, str(security_id))] = {
+                "LTP": quote.get("last_price"),
+                "Today's Open": ohlc.get("open"),
+                "Today's Low": ohlc.get("low"),
+                "Today's High": ohlc.get("high"),
+            }
     return out
 
 
-def previous_ohlc(sid, start, end):
-    payload = {"securityId": str(int(sid)), "exchangeSegment": "NSE_EQ", "instrument": "EQUITY", "expiryCode": 0, "oi": False, "fromDate": start, "toDate": end}
-    r = requests.post(HISTORY_URL, headers=headers(), json=payload, timeout=30)
-    r.raise_for_status()
-    data = r.json().get("data", {})
+def previous_ohlc(security_id, start, end):
+    payload = {
+        "securityId": str(int(security_id)),
+        "exchangeSegment": "NSE_EQ",
+        "instrument": "EQUITY",
+        "expiryCode": 0,
+        "oi": False,
+        "fromDate": start,
+        "toDate": end,
+    }
+    response = requests.post(
+        HISTORY_URL,
+        headers=headers(),
+        json=payload,
+        timeout=30,
+    )
+    response.raise_for_status()
+
+    data = response.json().get("data", {})
     fields = ["timestamp", "close", "high", "low"]
-    if not all(x in data for x in fields):
-        return {"PDC": None, "PDH": None, "PDL": None, "History Error": "Incomplete historical response"}
-    f = pd.DataFrame(data)[fields].apply(pd.to_numeric, errors="coerce").dropna().sort_values("timestamp")
-    if f.empty:
-        return {"PDC": None, "PDH": None, "PDL": None, "History Error": "No historical candle"}
-    x = f.iloc[-1]
-    return {"PDC": float(x.close), "PDH": float(x.high), "PDL": float(x.low), "History Error": None}
+    if not all(field in data for field in fields):
+        return {
+            "PDC": None,
+            "PDH": None,
+            "PDL": None,
+            "History Error": "Incomplete historical response",
+        }
+
+    candles = (
+        pd.DataFrame(data)[fields]
+        .apply(pd.to_numeric, errors="coerce")
+        .dropna()
+        .sort_values("timestamp")
+    )
+    if candles.empty:
+        return {
+            "PDC": None,
+            "PDH": None,
+            "PDL": None,
+            "History Error": "No historical candle",
+        }
+
+    candle = candles.iloc[-1]
+    return {
+        "PDC": float(candle.close),
+        "PDH": float(candle.high),
+        "PDL": float(candle.low),
+        "History Error": None,
+    }
 
 
 def bias(value):
-    if pd.isna(value): return "N/A"
-    if value > 1: return "🟢 Bullish"
-    if value < 1: return "🔴 Bearish"
+    if pd.isna(value):
+        return "N/A"
+    if value > 1:
+        return "🟢 Bullish"
+    if value < 1:
+        return "🔴 Bearish"
     return "⚪ Neutral"
 
 
 def calculate(df):
-    for c in ["LTP", "PDC", "PDH", "PDL"]: df[c] = pd.to_numeric(df[c], errors="coerce")
+    for field in ["LTP", "PDC", "PDH", "PDL"]:
+        df[field] = pd.to_numeric(df[field], errors="coerce")
+
     up = df.LTP.gt(df.PDC).groupby(df.Sector).transform("sum")
     down = df.LTP.lt(df.PDC).groupby(df.Sector).transform("sum")
     ratio = up / down.replace(0, float("nan"))
     ratio = ratio.mask((down == 0) & (up > 0), float("inf"))
+
     df["Sector A/D Ratio"] = ratio
     df["Sector Bias"] = ratio.apply(bias)
+
     valid = df.PDC.gt(0)
     df["PDC to PDH %"] = ((df.PDH - df.PDC) / df.PDC * 100).where(valid)
     df["PDC to PDL %"] = ((df.PDC - df.PDL) / df.PDC * 100).where(valid)
@@ -155,28 +253,87 @@ def calculate(df):
 
 
 st.title("📈 Nifty Midcap 150 Stock Scanner")
-st.caption("Current Nifty Midcap 150 universe | Dhan live LTP | Previous completed daily PDC/PDH/PDL | Sector A/D and bias")
+st.caption(
+    "Current Nifty Midcap 150 universe | Dhan live LTP | "
+    "Previous completed daily PDC/PDH/PDL | Sector A/D and bias"
+)
+
 now = datetime.now(IST)
+
 try:
     stocks = load_universe()
     end = now.date() - timedelta(days=1)
-    while end.weekday() >= 5: end -= timedelta(days=1)
+    while end.weekday() >= 5:
+        end -= timedelta(days=1)
     start = end - timedelta(days=10)
-    hist = {}
+
+    history = {}
     progress = st.progress(0, text="Loading previous-day OHLC...")
-    for i, sid in enumerate(stocks.security_id, 1):
-        try: hist[int(sid)] = previous_ohlc(sid, start.isoformat(), end.isoformat())
-        except Exception as e: hist[int(sid)] = {"PDC": None, "PDH": None, "PDL": None, "History Error": str(e)}
-        progress.progress(i / 150, text=f"Historical data: {i}/150")
+
+    for index, security_id in enumerate(stocks["security_id"], 1):
+        try:
+            history[int(security_id)] = previous_ohlc(
+                security_id,
+                start.isoformat(),
+                end.isoformat(),
+            )
+        except Exception as error:
+            history[int(security_id)] = {
+                "PDC": None,
+                "PDH": None,
+                "PDL": None,
+                "History Error": str(error),
+            }
+        progress.progress(index / 150, text=f"Historical data: {index}/150")
+
     progress.empty()
-    live = live_quotes(stocks) if dt_time(9, 15) <= now.time() <= dt_time(15, 30) and now.weekday() < 5 else {}
+
+    market_open = (
+        now.weekday() < 5
+        and dt_time(9, 15) <= now.time() <= dt_time(15, 30)
+    )
+    live = live_quotes(stocks) if market_open else {}
+
     rows = []
-    for r in stocks.to_dict("records"):
-        sid = int(r.security_id); row = {"Stock": r.stock, "Sector": r.sector, **live.get(("NSE_EQ", str(sid)), {}), **hist.get(sid, {})}; rows.append(row)
+    for record in stocks.to_dict("records"):
+        security_id = int(record["security_id"])
+        row = {
+            "Stock": record["stock"],
+            "Sector": record["sector"],
+            **live.get(("NSE_EQ", str(security_id)), {}),
+            **history.get(security_id, {}),
+        }
+        rows.append(row)
+
     data = calculate(pd.DataFrame(rows))
-    columns = ["Stock", "Sector", "Sector A/D Ratio", "Sector Bias", "LTP", "PDC", "PDH", "PDL", "PDC to PDH %", "PDC to PDL %"]
+    columns = [
+        "Stock",
+        "Sector",
+        "Sector A/D Ratio",
+        "Sector Bias",
+        "LTP",
+        "PDC",
+        "PDH",
+        "PDL",
+        "PDC to PDH %",
+        "PDC to PDL %",
+    ]
     display = data[columns].sort_values(["Sector", "Stock"])
+
     st.metric("Stocks scanned", len(display))
-    st.dataframe(display, use_container_width=True, hide_index=True, column_config={"Sector A/D Ratio": st.column_config.NumberColumn(format="%.2f"), "LTP": st.column_config.NumberColumn(format="%.2f"), "PDC": st.column_config.NumberColumn(format="%.2f"), "PDH": st.column_config.NumberColumn(format="%.2f"), "PDL": st.column_config.NumberColumn(format="%.2f"), "PDC to PDH %": st.column_config.NumberColumn(format="%.2f%%"), "PDC to PDL %": st.column_config.NumberColumn(format="%.2f%%")})
-except Exception as e:
-    st.error(f"Scanner error: {e}")
+    st.dataframe(
+        display,
+        use_container_width=True,
+        hide_index=True,
+        column_config={
+            "Sector A/D Ratio": st.column_config.NumberColumn(format="%.2f"),
+            "LTP": st.column_config.NumberColumn(format="%.2f"),
+            "PDC": st.column_config.NumberColumn(format="%.2f"),
+            "PDH": st.column_config.NumberColumn(format="%.2f"),
+            "PDL": st.column_config.NumberColumn(format="%.2f"),
+            "PDC to PDH %": st.column_config.NumberColumn(format="%.2f%%"),
+            "PDC to PDL %": st.column_config.NumberColumn(format="%.2f%%"),
+        },
+    )
+except Exception as error:
+    st.error(f"Scanner error: {error}")
