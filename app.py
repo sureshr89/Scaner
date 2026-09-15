@@ -63,6 +63,29 @@ def dhan_headers():
     }
 
 
+def test_dhan_connection():
+    """Check whether the current Dhan credentials are accepted."""
+    response = requests.get(
+        "https://api.dhan.co/v2/profile",
+        headers=dhan_headers(),
+        timeout=20,
+    )
+
+    if response.status_code == 200:
+        return True, "Dhan connection successful."
+
+    if response.status_code == 401:
+        return False, (
+            "Dhan returned 401 Unauthorized. Check the client ID and "
+            "access token. Do not add 'Bearer' before the token."
+        )
+
+    return False, (
+        f"Dhan profile failed with HTTP {response.status_code}: "
+        f"{response.text[:300]}"
+    )
+
+
 def request_with_retry(method, url, session=None, **kwargs):
     client = session or requests
     last_error = "unknown error"
@@ -418,36 +441,47 @@ def load_universe():
     show_spinner=False,
 )
 def live_quotes(ids):
+    """Fetch live NSE equity quotes from Dhan."""
+    clean_ids = sorted({int(value) for value in ids if pd.notna(value)})
+
+    if not clean_ids:
+        raise RuntimeError("No Dhan security IDs were found.")
+
     response = request_with_retry(
         "POST",
         QUOTE_URL,
         headers=dhan_headers(),
-        json={
-            "NSE_EQ": sorted(
-                {int(value) for value in ids}
-            )
-        },
+        json={"NSE_EQ": clean_ids},
         timeout=60,
     )
+
+    if response.status_code == 401:
+        raise RuntimeError(
+            "Dhan returned 401 Unauthorized. Check DHAN_CLIENT_ID and "
+            "DHAN_ACCESS_TOKEN in Streamlit Secrets."
+        )
 
     response.raise_for_status()
 
     payload = response.json()
+    segments = payload.get("data") or {}
+
+    if not isinstance(segments, dict):
+        raise RuntimeError(
+            f"Unexpected Dhan quote response: {str(payload)[:500]}"
+        )
+
     output = {}
 
-    for segment, items in (
-        payload.get("data") or {}
-    ).items():
-        for sid, quote in (items or {}).items():
+    for segment, items in segments.items():
+        if not isinstance(items, dict):
+            continue
+
+        for sid, quote in items.items():
             quote = quote or {}
             ohlc = quote.get("ohlc") or {}
 
-            output[
-                (
-                    segment,
-                    str(sid),
-                )
-            ] = {
+            output[(str(segment), str(sid))] = {
                 "LTP": quote.get("last_price"),
                 "Today's Open": ohlc.get("open"),
                 "Today's Low": ohlc.get("low"),
@@ -456,7 +490,7 @@ def live_quotes(ids):
 
     if not output:
         raise RuntimeError(
-            f"Dhan returned no quote data: {payload}"
+            f"Dhan returned no quote data: {str(payload)[:500]}"
         )
 
     return output
@@ -483,7 +517,8 @@ def previous_ohlc(sid, start, end):
 
     response.raise_for_status()
 
-    raw = response.json().get("data") or {}
+    payload_response = response.json()
+    raw = payload_response.get("data") or {}
 
     fields = [
         "timestamp",
@@ -492,14 +527,21 @@ def previous_ohlc(sid, start, end):
         "low",
     ]
 
-    if not isinstance(raw, dict) or not all(
-        field in raw for field in fields
-    ):
-        return {
-            "PDC": None,
-            "PDH": None,
-            "PDL": None,
-        }
+    if not isinstance(raw, dict):
+        raise RuntimeError(
+            f"Historical response data is not an object: "
+            f"{str(payload_response)[:500]}"
+        )
+
+    missing_fields = [
+        field for field in fields if field not in raw
+    ]
+
+    if missing_fields:
+        raise RuntimeError(
+            f"Historical response missing {missing_fields}: "
+            f"{str(payload_response)[:500]}"
+        )
 
     candles = pd.DataFrame(
         {
@@ -758,15 +800,26 @@ def render():
         stocks["security_id"].astype(int)
     )
 
-    history, failures = load_history(
-        ids,
-        (
-            now.date() - timedelta(days=30)
-        ).isoformat(),
-        now.date().isoformat(),
-    )
+    try:
+        history, failures = load_history(
+            ids,
+            (
+                now.date() - timedelta(days=30)
+            ).isoformat(),
+            now.date().isoformat(),
+        )
+    except Exception as exc:
+        history = {}
+        failures = [
+            f"History loader failed: {type(exc).__name__}: {exc}"
+        ]
 
     if failures:
+        st.error(
+            f"Previous-day OHLC failed for {len(failures)} stocks. "
+            "PDC, PDH, PDL and signals may be blank."
+        )
+
         with st.expander(
             f"Historical data warnings ({len(failures)})"
         ):
@@ -949,11 +1002,25 @@ st.caption(
 
 with st.sidebar:
     st.subheader("Data controls")
-    if st.button("🔄 Clear cache and refresh"):
+
+    if st.button("🔄 Clear cache and refresh", use_container_width=True):
         st.cache_data.clear()
         st.session_state.pop("last_live_quotes", None)
         st.session_state.pop("quote_time", None)
         st.rerun()
+
+    if st.button("🔐 Test Dhan connection", use_container_width=True):
+        try:
+            with st.spinner("Testing Dhan credentials..."):
+                connected, message = test_dhan_connection()
+
+            if connected:
+                st.success(message)
+            else:
+                st.error(message)
+        except Exception as exc:
+            st.error(f"Connection test error: {type(exc).__name__}: {exc}")
+
     st.caption(
         "If live data shows 401 Unauthorized, update "
         "DHAN_CLIENT_ID and DHAN_ACCESS_TOKEN in Streamlit Secrets."
