@@ -579,7 +579,7 @@ def load_history(ids, start, end):
             }
 
             failures.append(
-                f"{sid}: {exc}"
+                f"{sid}: {type(exc).__name__}: {exc}"
             )
 
     return result, failures
@@ -779,6 +779,12 @@ def render():
 
     if market_open(now):
         try:
+            # Validate credentials before making the quote request.
+            if not secret("DHAN_CLIENT_ID") or not secret("DHAN_ACCESS_TOKEN"):
+                raise RuntimeError(
+                    "Missing DHAN_CLIENT_ID or DHAN_ACCESS_TOKEN in Streamlit Secrets."
+                )
+
             quotes = live_quotes(ids)
 
             st.session_state[
@@ -940,6 +946,18 @@ st.caption(
     "Nifty 500 • Dhan live quotes • "
     "previous-day OHLC • sector breadth"
 )
+
+with st.sidebar:
+    st.subheader("Data controls")
+    if st.button("🔄 Clear cache and refresh"):
+        st.cache_data.clear()
+        st.session_state.pop("last_live_quotes", None)
+        st.session_state.pop("quote_time", None)
+        st.rerun()
+    st.caption(
+        "If live data shows 401 Unauthorized, update "
+        "DHAN_CLIENT_ID and DHAN_ACCESS_TOKEN in Streamlit Secrets."
+    )
 
 
 try:
